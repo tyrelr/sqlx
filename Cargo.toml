@@ -170,6 +170,7 @@ hex = "0.4.3"
 tempdir = "0.3.7"
 # Needed to test SQLCipher
 libsqlite3-sys = { version = "0.25", features = ["bundled-sqlcipher"] }
+proptest = "1.0.0"
 
 #
 # Any
@@ -211,6 +212,11 @@ required-features = ["sqlite"]
 [[test]]
 name = "sqlite-describe"
 path = "tests/sqlite/describe.rs"
+required-features = ["sqlite"]
+
+[[test]]
+name = "sqlite-describe-proptest"
+path = "tests/sqlite/describe-proptest.rs"
 required-features = ["sqlite"]
 
 [[test]]
