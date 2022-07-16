@@ -56,9 +56,32 @@ fn my_accounts_column_strategy() -> impl Strategy<Value = ColumnModel> {
 }
 
 #[derive(Debug, PartialEq, Hash, Clone)]
+struct TableModel {
+    name: &'static str,
+    alias: Option<String>,
+}
+impl TableModel {
+    fn as_sql_code(&self) -> String {
+        if let Some(alias) = &self.alias {
+            format!("{} {}", self.name, alias)
+        } else {
+            self.name.to_string()
+        }
+    }
+
+    fn as_sql_name(&self) -> String {
+        if let Some(alias) = &self.alias {
+            alias.to_string()
+        } else {
+            self.name.to_string()
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Hash, Clone)]
 enum ExpressionModel {
     ColumnProjection {
-        table: Option<&'static str>,
+        table_alias: Option<String>,
         column: ColumnModel,
     },
 }
@@ -66,9 +89,12 @@ enum ExpressionModel {
 impl ExpressionModel {
     fn as_sql_code(&self) -> String {
         match self {
-            Self::ColumnProjection { table, column } => {
-                if let Some(table) = table {
-                    format!("{}.{}", table, column.name)
+            Self::ColumnProjection {
+                table_alias,
+                column,
+            } => {
+                if let Some(table_alias) = table_alias {
+                    format!("{}.{}", table_alias, column.name)
                 } else {
                     column.name.to_string()
                 }
@@ -96,38 +122,67 @@ impl ExpressionModel {
 }
 
 fn my_expression_model_strategy<C: Strategy<Value = ColumnModel>>(
-    table: &'static str,
+    table: TableModel,
     column_strategy: C,
 ) -> impl Strategy<Value = ExpressionModel> {
-    (prop_oneof![Just(None), Just(Some(table))], column_strategy)
-        .prop_map(move |(table, column)| ExpressionModel::ColumnProjection { table, column })
+    (
+        prop_oneof![Just(None), Just(Some(table.as_sql_name()))],
+        column_strategy,
+    )
+        .prop_map(
+            move |(table_alias, column)| ExpressionModel::ColumnProjection {
+                table_alias,
+                column,
+            },
+        )
 }
 
 #[derive(Debug, PartialEq, Hash, Clone)]
 struct QueryModel {
     pub projections: Vec<ExpressionModel>,
-    pub table: &'static str,
+    pub table: TableModel,
 }
 
-fn my_query_strategy_args<T: Strategy<Value = &'static str>, C: Strategy<Value = ColumnModel>>(
+fn my_query_strategy_args<T: Strategy<Value = TableModel>, C: Strategy<Value = ColumnModel>>(
     table_strategy: T,
     column_strategy: C,
 ) -> impl Strategy<Value = QueryModel> {
     let column_strategy = std::sync::Arc::new(column_strategy);
     table_strategy.prop_flat_map(move |table| {
         let columns_strategy = prop::collection::vec(
-            my_expression_model_strategy(table, column_strategy.clone()),
+            my_expression_model_strategy(table.clone(), column_strategy.clone()),
             1..100,
         );
-        columns_strategy.prop_map(move |projections| QueryModel { projections, table })
+        columns_strategy.prop_map(move |projections| QueryModel {
+            projections,
+            table: table.clone(),
+        })
     })
 }
 
 fn my_query_strategy() -> impl Strategy<Value = QueryModel> {
     prop_oneof![
-        my_query_strategy_args(Just("tweet"), my_tweet_column_strategy()),
-        my_query_strategy_args(Just("accounts"), my_accounts_column_strategy()),
-        my_query_strategy_args(Just("accounts_view"), my_accounts_column_strategy()),
+        my_query_strategy_args(
+            Just(TableModel {
+                name: "tweet",
+                alias: None
+            }),
+            my_tweet_column_strategy()
+        ),
+        my_query_strategy_args(
+            Just(TableModel {
+                name: "accounts",
+                alias: Some("accounts".to_string())
+            }),
+            my_accounts_column_strategy()
+        ),
+        my_query_strategy_args(
+            Just(TableModel {
+                name: "accounts_view",
+                alias: None
+            }),
+            my_accounts_column_strategy()
+        ),
     ]
 }
 
@@ -141,7 +196,7 @@ proptest! {
                 &format!(
                 "SELECT {} FROM {}",
                 query_model.projections.iter().map(|c|c.as_sql_code()).collect::<Vec<_>>().join(","),
-                &query_model.table
+                &query_model.table.as_sql_code()
             )).await.unwrap();
 
             let columns = info.columns();
