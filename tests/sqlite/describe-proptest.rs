@@ -3,10 +3,32 @@ use sqlx::TypeInfo;
 use sqlx::{sqlite::Sqlite, Column, Executor};
 use sqlx_test::new;
 
+//TODO: find the right balance between sqlite types vs. high-level types
+#[derive(Debug, PartialEq, Hash, Clone, Copy)]
+enum ColType {
+    Boolean,
+    Integer,
+    Real,
+    Text,
+    Blob,
+}
+
+impl ColType {
+    fn name(self) -> &'static str {
+        match self {
+            ColType::Boolean => "BOOLEAN",
+            ColType::Integer => "INTEGER",
+            ColType::Real => "FLOAT",
+            ColType::Text => "TEXT",
+            ColType::Blob => "BLOB",
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Hash, Clone)]
 struct ColumnModel {
     pub name: &'static str,
-    pub typename: &'static str,
+    pub col_type: ColType,
     pub nullable: bool,
 }
 
@@ -14,22 +36,22 @@ fn my_tweet_column_strategy() -> impl Strategy<Value = ColumnModel> {
     prop_oneof![
         Just(ColumnModel {
             name: "id",
-            typename: "INTEGER",
+            col_type: ColType::Integer,
             nullable: false
         }),
         Just(ColumnModel {
             name: "text",
-            typename: "TEXT",
+            col_type: ColType::Text,
             nullable: false
         }),
         Just(ColumnModel {
             name: "is_sent",
-            typename: "BOOLEAN",
+            col_type: ColType::Boolean,
             nullable: false
         }),
         Just(ColumnModel {
             name: "owner_id",
-            typename: "INTEGER",
+            col_type: ColType::Integer,
             nullable: true
         })
     ]
@@ -39,17 +61,17 @@ fn my_accounts_column_strategy() -> impl Strategy<Value = ColumnModel> {
     prop_oneof![
         Just(ColumnModel {
             name: "id",
-            typename: "INTEGER",
+            col_type: ColType::Integer,
             nullable: false
         }),
         Just(ColumnModel {
             name: "name",
-            typename: "TEXT",
+            col_type: ColType::Text,
             nullable: false
         }),
         Just(ColumnModel {
             name: "is_active",
-            typename: "BOOLEAN",
+            col_type: ColType::Boolean,
             nullable: true
         })
     ]
@@ -78,12 +100,35 @@ impl TableModel {
     }
 }
 
+#[derive(Debug, PartialEq, Hash, Clone, Copy)]
+enum InfixNumericOperation {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+impl InfixNumericOperation {
+    fn as_sql_code(self) -> &'static str {
+        match self {
+            InfixNumericOperation::Add => "+",
+            InfixNumericOperation::Sub => "-",
+            InfixNumericOperation::Mul => "*",
+            InfixNumericOperation::Div => "/",
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Hash, Clone)]
 enum ExpressionModel {
     ColumnProjection {
         table_alias: Option<String>,
         column: ColumnModel,
     },
+    InfixNumericOperation(
+        InfixNumericOperation,
+        Box<ExpressionModel>,
+        Box<ExpressionModel>,
+    ),
 }
 
 impl ExpressionModel {
@@ -99,33 +144,52 @@ impl ExpressionModel {
                     column.name.to_string()
                 }
             }
+            Self::InfixNumericOperation(op, left, right) => {
+                format!(
+                    "({} {} {})",
+                    left.as_sql_code(),
+                    op.as_sql_code(),
+                    right.as_sql_code()
+                )
+            }
         }
     }
 
-    fn output_name(&self) -> &'static str {
+    fn output_name(&self) -> Option<&'static str> {
         match self {
-            Self::ColumnProjection { column, .. } => column.name,
+            Self::ColumnProjection { column, .. } => Some(column.name),
+            Self::InfixNumericOperation(..) => None,
         }
     }
 
-    fn output_typename(&self) -> &'static str {
+    fn output_type(&self) -> ColType {
         match self {
-            Self::ColumnProjection { column, .. } => column.typename,
+            Self::ColumnProjection { column, .. } => column.col_type,
+            Self::InfixNumericOperation(_, left, right) => {
+                match (left.output_type(), right.output_type()) {
+                    (ColType::Real, _) => ColType::Real,
+                    (ColType::Integer, ColType::Real) => ColType::Real,
+                    _ => ColType::Integer,
+                }
+            }
         }
     }
 
     fn output_nullable(&self) -> bool {
         match self {
             Self::ColumnProjection { column, .. } => column.nullable,
+            Self::InfixNumericOperation(_, left, right) => {
+                left.output_nullable() || right.output_nullable()
+            }
         }
     }
 }
 
-fn my_expression_model_strategy<C: Strategy<Value = ColumnModel>>(
+fn my_expression_model_strategy<C: 'static + Strategy<Value = ColumnModel>>(
     table: TableModel,
     column_strategy: C,
 ) -> impl Strategy<Value = ExpressionModel> {
-    (
+    let leaf = (
         prop_oneof![Just(None), Just(Some(table.as_sql_name()))],
         column_strategy,
     )
@@ -134,7 +198,23 @@ fn my_expression_model_strategy<C: Strategy<Value = ColumnModel>>(
                 table_alias,
                 column,
             },
+        );
+
+    leaf.prop_recursive(5, 15, 10, move |inner| {
+        (
+            prop_oneof![
+                Just(InfixNumericOperation::Add),
+                Just(InfixNumericOperation::Sub),
+                Just(InfixNumericOperation::Mul),
+                //Just(InfixNumericOperation::Div) //TODO: dividing by strings acts weird. ex: SELECT 1/"a"; -> null
+            ],
+            inner.clone(),
+            inner.clone(),
         )
+            .prop_map(move |(op, i1, i2)| {
+                ExpressionModel::InfixNumericOperation(op, i1.into(), i2.into())
+            })
+    })
 }
 
 #[derive(Debug, PartialEq, Hash, Clone)]
@@ -143,7 +223,10 @@ struct QueryModel {
     pub table: TableModel,
 }
 
-fn my_query_strategy_args<T: Strategy<Value = TableModel>, C: Strategy<Value = ColumnModel>>(
+fn my_query_strategy_args<
+    T: 'static + Strategy<Value = TableModel>,
+    C: 'static + Strategy<Value = ColumnModel>,
+>(
     table_strategy: T,
     column_strategy: C,
 ) -> impl Strategy<Value = QueryModel> {
@@ -203,9 +286,12 @@ proptest! {
 
             for (i,expr_model) in query_model.projections.iter().enumerate()
             {
-                prop_assert_eq!(columns[i].name(), expr_model.output_name());
+                if expr_model.output_name().is_some()
+                {
+                    prop_assert_eq!(Some(columns[i].name()), expr_model.output_name());
+                }
                 prop_assert_eq!(info.nullable(i), Some(expr_model.output_nullable()));
-                prop_assert_eq!(columns[i].type_info().name(), expr_model.output_typename());
+                prop_assert_eq!(columns[i].type_info().name(), expr_model.output_type().name());
             }
 
             Ok(())
