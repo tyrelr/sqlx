@@ -26,31 +26,52 @@ impl ColType {
 }
 
 #[derive(Debug, PartialEq, Hash, Clone)]
+struct ColumnInfo {
+    pub name: Option<&'static str>,
+    pub col_type: ColType,
+    pub nullable: bool,
+}
+
+#[derive(Debug, PartialEq, Hash, Clone)]
 struct ColumnModel {
     pub name: &'static str,
     pub col_type: ColType,
     pub nullable: bool,
 }
 
+impl ColumnModel {
+    fn as_sql_code(&self) -> String {
+        self.name.to_string()
+    }
+
+    fn to_column_info(&self) -> ColumnInfo {
+        ColumnInfo {
+            name: Some(self.name),
+            col_type: self.col_type,
+            nullable: self.nullable,
+        }
+    }
+}
+
 fn my_tweet_column_strategy() -> impl Strategy<Value = ColumnModel> {
     prop_oneof![
         Just(ColumnModel {
-            name: "id",
+            name: "id".into(),
             col_type: ColType::Integer,
             nullable: false
         }),
         Just(ColumnModel {
-            name: "text",
+            name: "text".into(),
             col_type: ColType::Text,
             nullable: false
         }),
         Just(ColumnModel {
-            name: "is_sent",
+            name: "is_sent".into(),
             col_type: ColType::Boolean,
             nullable: false
         }),
         Just(ColumnModel {
-            name: "owner_id",
+            name: "owner_id".into(),
             col_type: ColType::Integer,
             nullable: true
         })
@@ -60,17 +81,17 @@ fn my_tweet_column_strategy() -> impl Strategy<Value = ColumnModel> {
 fn my_accounts_column_strategy() -> impl Strategy<Value = ColumnModel> {
     prop_oneof![
         Just(ColumnModel {
-            name: "id",
+            name: "id".into(),
             col_type: ColType::Integer,
             nullable: false
         }),
         Just(ColumnModel {
-            name: "name",
+            name: "name".into(),
             col_type: ColType::Text,
             nullable: false
         }),
         Just(ColumnModel {
-            name: "is_active",
+            name: "is_active".into(),
             col_type: ColType::Boolean,
             nullable: true
         })
@@ -80,93 +101,61 @@ fn my_accounts_column_strategy() -> impl Strategy<Value = ColumnModel> {
 #[derive(Debug, PartialEq, Hash, Clone)]
 struct TableModel {
     name: &'static str,
-    alias: Option<String>,
+    output_alias: Option<String>,
 }
 impl TableModel {
     fn as_sql_code(&self) -> String {
-        if let Some(alias) = &self.alias {
-            format!("{} {}", self.name, alias)
+        if let Some(output_alias) = &self.output_alias {
+            format!("{} {}", self.name, output_alias)
         } else {
             self.name.to_string()
         }
     }
 
     fn as_sql_name(&self) -> String {
-        if let Some(alias) = &self.alias {
-            alias.to_string()
+        if let Some(output_alias) = &self.output_alias {
+            output_alias.to_string()
         } else {
             self.name.to_string()
         }
     }
 }
 
+#[derive(Debug, PartialEq, Hash, Clone)]
+struct ColumnProjection {
+    source_alias: String,
+    column: ColumnModel,
+}
+impl ColumnProjection {
+    fn as_sql_code(&self) -> String {
+        format!("{}.{}", self.source_alias, self.column.as_sql_code())
+    }
+
+    fn output_column_info(&self) -> ColumnInfo {
+        self.column.to_column_info()
+    }
+}
+
 #[derive(Debug, PartialEq, Hash, Clone, Copy)]
-enum InfixNumericOperation {
+enum InfixNumericOperationType {
     Add,
     Sub,
     Mul,
     Div,
 }
-impl InfixNumericOperation {
+impl InfixNumericOperationType {
     fn as_sql_code(self) -> &'static str {
         match self {
-            InfixNumericOperation::Add => "+",
-            InfixNumericOperation::Sub => "-",
-            InfixNumericOperation::Mul => "*",
-            InfixNumericOperation::Div => "/",
+            Self::Add => "+",
+            Self::Sub => "-",
+            Self::Mul => "*",
+            Self::Div => "/",
         }
     }
-}
-
-#[derive(Debug, PartialEq, Hash, Clone)]
-enum ExpressionModel {
-    ColumnProjection {
-        table_alias: Option<String>,
-        column: ColumnModel,
-    },
-    InfixNumericOperation(
-        InfixNumericOperation,
-        Box<ExpressionModel>,
-        Box<ExpressionModel>,
-    ),
-}
-
-impl ExpressionModel {
-    fn as_sql_code(&self) -> String {
+    fn output_column_type(&self, left: &ColumnInfo, right: &ColumnInfo) -> ColType {
         match self {
-            Self::ColumnProjection {
-                table_alias,
-                column,
-            } => {
-                if let Some(table_alias) = table_alias {
-                    format!("{}.{}", table_alias, column.name)
-                } else {
-                    column.name.to_string()
-                }
-            }
-            Self::InfixNumericOperation(op, left, right) => {
-                format!(
-                    "({} {} {})",
-                    left.as_sql_code(),
-                    op.as_sql_code(),
-                    right.as_sql_code()
-                )
-            }
-        }
-    }
-
-    fn output_name(&self) -> Option<&'static str> {
-        match self {
-            Self::ColumnProjection { column, .. } => Some(column.name),
-            Self::InfixNumericOperation(..) => None,
-        }
-    }
-
-    fn output_type(&self) -> ColType {
-        match self {
-            Self::ColumnProjection { column, .. } => column.col_type,
-            Self::InfixNumericOperation(_, left, right) => {
-                match (left.output_type(), right.output_type()) {
+            Self::Add | Self::Sub | Self::Mul | Self::Div => {
+                match (left.col_type, right.col_type) {
                     (ColType::Real, _) => ColType::Real,
                     (ColType::Integer, ColType::Real) => ColType::Real,
                     _ => ColType::Integer,
@@ -174,13 +163,68 @@ impl ExpressionModel {
             }
         }
     }
-
-    fn output_nullable(&self) -> bool {
+    fn output_nullable(&self, left: &ColumnInfo, right: &ColumnInfo) -> bool {
         match self {
-            Self::ColumnProjection { column, .. } => column.nullable,
-            Self::InfixNumericOperation(_, left, right) => {
-                left.output_nullable() || right.output_nullable()
-            }
+            Self::Add | Self::Sub | Self::Mul => left.nullable || right.nullable,
+            Self::Div => {
+                left.nullable
+                    || right.nullable
+                    || right.col_type == ColType::Text
+                    || right.col_type == ColType::Blob
+            } //dividing by string or blob gives null
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Hash, Clone)]
+struct InfixNumericOperation {
+    operation: InfixNumericOperationType,
+    left: ExpressionModel,
+    right: ExpressionModel,
+}
+
+impl InfixNumericOperation {
+    fn as_sql_code(&self) -> String {
+        format!(
+            "({} {} {})",
+            self.left.as_sql_code(),
+            self.operation.as_sql_code(),
+            self.right.as_sql_code()
+        )
+    }
+    fn output_column_info(&self) -> ColumnInfo {
+        ColumnInfo {
+            name: None,
+            col_type: self.operation.output_column_type(
+                &self.left.output_column_info(),
+                &self.right.output_column_info(),
+            ),
+            nullable: self.operation.output_nullable(
+                &self.left.output_column_info(),
+                &self.right.output_column_info(),
+            ),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Hash, Clone)]
+enum ExpressionModel {
+    ColumnProjection(ColumnProjection),
+    InfixNumericOperation(Box<InfixNumericOperation>),
+}
+
+impl ExpressionModel {
+    fn as_sql_code(&self) -> String {
+        match self {
+            Self::ColumnProjection(col) => col.as_sql_code(),
+            Self::InfixNumericOperation(op) => op.as_sql_code(),
+        }
+    }
+
+    fn output_column_info(&self) -> ColumnInfo {
+        match self {
+            Self::ColumnProjection(col) => col.output_column_info(),
+            Self::InfixNumericOperation(op) => op.output_column_info(),
         }
     }
 }
@@ -189,30 +233,35 @@ fn my_expression_model_strategy<C: 'static + Strategy<Value = ColumnModel>>(
     table: TableModel,
     column_strategy: C,
 ) -> impl Strategy<Value = ExpressionModel> {
-    let leaf = (
-        prop_oneof![Just(None), Just(Some(table.as_sql_name()))],
-        column_strategy,
-    )
-        .prop_map(
-            move |(table_alias, column)| ExpressionModel::ColumnProjection {
-                table_alias,
+    let leaf = (prop_oneof![Just(table.as_sql_name())], column_strategy).prop_map(
+        move |(source_alias, column)| {
+            ExpressionModel::ColumnProjection(ColumnProjection {
+                source_alias,
                 column,
-            },
-        );
+            })
+        },
+    );
 
-    leaf.prop_recursive(5, 15, 10, move |inner| {
+    leaf.prop_recursive(5, 15, 2, move |inner| {
         (
             prop_oneof![
-                Just(InfixNumericOperation::Add),
-                Just(InfixNumericOperation::Sub),
-                Just(InfixNumericOperation::Mul),
-                //Just(InfixNumericOperation::Div) //TODO: dividing by strings acts weird. ex: SELECT 1/"a"; -> null
+                Just(InfixNumericOperationType::Add),
+                Just(InfixNumericOperationType::Sub),
+                Just(InfixNumericOperationType::Mul),
+                //Just(InfixNumericOperationType::Div) //TODO: dividing by strings acts weird, sqlx doesn't implement that. ex: SELECT 1/"a"; -> null
             ],
             inner.clone(),
             inner.clone(),
         )
-            .prop_map(move |(op, i1, i2)| {
-                ExpressionModel::InfixNumericOperation(op, i1.into(), i2.into())
+            .prop_map(move |(operation, expr1, expr2)| {
+                ExpressionModel::InfixNumericOperation(
+                    InfixNumericOperation {
+                        operation,
+                        left: expr1,
+                        right: expr2,
+                    }
+                    .into(),
+                )
             })
     })
 }
@@ -248,21 +297,21 @@ fn my_query_strategy() -> impl Strategy<Value = QueryModel> {
         my_query_strategy_args(
             Just(TableModel {
                 name: "tweet",
-                alias: None
+                output_alias: None
             }),
             my_tweet_column_strategy()
         ),
         my_query_strategy_args(
             Just(TableModel {
                 name: "accounts",
-                alias: Some("accounts".to_string())
+                output_alias: Some("accounts".to_string())
             }),
             my_accounts_column_strategy()
         ),
         my_query_strategy_args(
             Just(TableModel {
                 name: "accounts_view",
-                alias: None
+                output_alias: None
             }),
             my_accounts_column_strategy()
         ),
@@ -276,22 +325,24 @@ proptest! {
         let res = ::sqlx_rt::async_std::task::block_on(async{
             let mut conn = new::<Sqlite>().await.unwrap();
             let info = conn.describe(
-                &format!(
+                &dbg!(format!(
                 "SELECT {} FROM {}",
                 query_model.projections.iter().map(|c|c.as_sql_code()).collect::<Vec<_>>().join(","),
                 &query_model.table.as_sql_code()
-            )).await.unwrap();
+            ))).await.unwrap();
 
             let columns = info.columns();
 
             for (i,expr_model) in query_model.projections.iter().enumerate()
             {
-                if expr_model.output_name().is_some()
+                let expected_column = expr_model.output_column_info();
+
+                if let Some(expected_column_name) = expected_column.name
                 {
-                    prop_assert_eq!(Some(columns[i].name()), expr_model.output_name());
+                    prop_assert_eq!(&columns[i].name(), &expected_column_name);
                 }
-                prop_assert_eq!(info.nullable(i), Some(expr_model.output_nullable()));
-                prop_assert_eq!(columns[i].type_info().name(), expr_model.output_type().name());
+                prop_assert_eq!(info.nullable(i), Some(expected_column.nullable));
+                prop_assert_eq!(columns[i].type_info().name(), expected_column.col_type.name());
             }
 
             Ok(())
