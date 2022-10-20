@@ -122,6 +122,41 @@ impl TableModel {
 }
 
 #[derive(Debug, PartialEq, Hash, Clone)]
+enum LiteralValue {
+    Boolean,
+    Integer,
+    Real,
+    Text,
+    Blob,
+}
+impl LiteralValue {
+    fn as_sql_code(&self) -> String {
+        match self {
+            Self::Boolean => "true",
+            Self::Integer => "1",
+            Self::Real => "1.0",
+            Self::Text => "\'\'",
+            Self::Blob => "x\'\'",
+        }
+        .to_string()
+    }
+
+    fn output_column_info(&self) -> ColumnInfo {
+        ColumnInfo {
+            name: None, //TODO: check literal expression name too
+            col_type: match self {
+                Self::Boolean => ColType::Integer,
+                Self::Integer => ColType::Integer,
+                Self::Real => ColType::Real,
+                Self::Text => ColType::Text,
+                Self::Blob => ColType::Blob,
+            },
+            nullable: false,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Hash, Clone)]
 struct ColumnProjection {
     source_alias: String,
     column: ColumnModel,
@@ -209,6 +244,7 @@ impl InfixNumericOperation {
 
 #[derive(Debug, PartialEq, Hash, Clone)]
 enum ExpressionModel {
+    LiteralValue(LiteralValue),
     ColumnProjection(ColumnProjection),
     InfixNumericOperation(Box<InfixNumericOperation>),
 }
@@ -216,6 +252,7 @@ enum ExpressionModel {
 impl ExpressionModel {
     fn as_sql_code(&self) -> String {
         match self {
+            Self::LiteralValue(lit) => lit.as_sql_code(),
             Self::ColumnProjection(col) => col.as_sql_code(),
             Self::InfixNumericOperation(op) => op.as_sql_code(),
         }
@@ -223,6 +260,7 @@ impl ExpressionModel {
 
     fn output_column_info(&self) -> ColumnInfo {
         match self {
+            Self::LiteralValue(lit) => lit.output_column_info(),
             Self::ColumnProjection(col) => col.output_column_info(),
             Self::InfixNumericOperation(op) => op.output_column_info(),
         }
@@ -233,7 +271,7 @@ fn my_expression_model_strategy<C: 'static + Strategy<Value = ColumnModel>>(
     table: TableModel,
     column_strategy: C,
 ) -> impl Strategy<Value = ExpressionModel> {
-    let leaf = (prop_oneof![Just(table.as_sql_name())], column_strategy).prop_map(
+    let table_projection = (prop_oneof![Just(table.as_sql_name())], column_strategy).prop_map(
         move |(source_alias, column)| {
             ExpressionModel::ColumnProjection(ColumnProjection {
                 source_alias,
@@ -241,6 +279,16 @@ fn my_expression_model_strategy<C: 'static + Strategy<Value = ColumnModel>>(
             })
         },
     );
+
+    let literal_projection = prop_oneof![
+        Just(ExpressionModel::LiteralValue(LiteralValue::Boolean)),
+        Just(ExpressionModel::LiteralValue(LiteralValue::Integer)),
+        Just(ExpressionModel::LiteralValue(LiteralValue::Real)),
+        Just(ExpressionModel::LiteralValue(LiteralValue::Text)),
+        Just(ExpressionModel::LiteralValue(LiteralValue::Blob)),
+    ];
+
+    let leaf = prop_oneof![literal_projection, table_projection];
 
     leaf.prop_recursive(5, 15, 2, move |inner| {
         (
