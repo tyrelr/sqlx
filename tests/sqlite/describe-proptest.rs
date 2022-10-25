@@ -321,13 +321,15 @@ fn my_literal_expression_model_strategy() -> impl Strategy<Value = ExpressionMod
 fn my_table_projection_expression_model_strategy(
     table: TableModel,
 ) -> impl Strategy<Value = ExpressionModel> {
-    let column_strategy = proptest::sample::select(table.columns.clone());
-    column_strategy.prop_map(move |column: ColumnModel| {
-        ExpressionModel::ColumnProjection(ColumnProjection {
-            source_alias: table.as_sql_name(),
-            column,
+    prop_oneof![my_literal_expression_model_strategy(), {
+        let column_strategy = proptest::sample::select(table.columns.clone());
+        column_strategy.prop_map(move |column: ColumnModel| {
+            ExpressionModel::ColumnProjection(ColumnProjection {
+                source_alias: table.as_sql_name(),
+                column,
+            })
         })
-    })
+    }]
 }
 
 fn my_expression_tree_strategy<E: 'static + Strategy<Value = ExpressionModel>>(
@@ -360,16 +362,66 @@ fn my_expression_tree_strategy<E: 'static + Strategy<Value = ExpressionModel>>(
 #[derive(Debug, PartialEq, Hash, Clone)]
 struct QueryModel {
     pub projections: Vec<ExpressionModel>,
-    pub table: TableModel,
+    pub table: Option<TableModel>,
 }
 
-fn my_query_strategy_args<T: 'static + Strategy<Value = TableModel>>(
+impl QueryModel {
+    pub fn as_sql_code(&self) -> String {
+        if let Some(table) = &self.table {
+            format!(
+                "SELECT {} FROM {}",
+                self.projections
+                    .iter()
+                    .map(|c| c.as_sql_code())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                &table.as_sql_code()
+            )
+        } else {
+            format!(
+                "SELECT {}",
+                self.projections
+                    .iter()
+                    .map(|c| c.as_sql_code())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        }
+    }
+
+    pub fn as_sql_code_distinct_types(&self) -> String {
+        if let Some(table) = &self.table {
+            format!(
+                "SELECT DISTINCT {} FROM {}",
+                self.projections
+                    .iter()
+                    .map(|c| c.as_sql_code())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                &table.as_sql_code()
+            )
+        } else {
+            format!(
+                "SELECT {}",
+                self.projections
+                    .iter()
+                    .map(|c| c.as_sql_code())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        }
+    }
+}
+
+fn my_query_strategy_args<T: 'static + Strategy<Value = Option<TableModel>>>(
     table_strategy: T,
 ) -> impl Strategy<Value = QueryModel> {
     table_strategy.prop_flat_map(move |table| {
-        let literal_projection = my_literal_expression_model_strategy();
-        let table_projection = my_table_projection_expression_model_strategy(table.clone());
-        let leaf_strategy = prop_oneof![literal_projection, table_projection];
+        let leaf_strategy: BoxedStrategy<ExpressionModel> = if let Some(table) = table.clone() {
+            my_table_projection_expression_model_strategy(table.clone()).boxed()
+        } else {
+            my_literal_expression_model_strategy().boxed()
+        };
 
         let expression_model_strategy = my_expression_tree_strategy(leaf_strategy);
         let columns_strategy = prop::collection::vec(expression_model_strategy, 1..10);
@@ -382,7 +434,7 @@ fn my_query_strategy_args<T: 'static + Strategy<Value = TableModel>>(
 }
 
 fn my_query_strategy() -> impl Strategy<Value = QueryModel> {
-    prop_oneof![my_query_strategy_args(my_table_strategy()),]
+    my_query_strategy_args(proptest::option::of(my_table_strategy()))
 }
 
 proptest! {
@@ -393,11 +445,7 @@ proptest! {
             let mut conn = new::<Sqlite>().await.unwrap();
             {
                 let info = conn.describe(
-                    &dbg!(format!(
-                    "SELECT {} FROM {}",
-                    query_model.projections.iter().map(|c|c.as_sql_code()).collect::<Vec<_>>().join(","),
-                    &query_model.table.as_sql_code()
-                ))).await.unwrap();
+                    &dbg!(query_model.as_sql_code())).await.unwrap();
 
                 let columns = info.columns();
 
@@ -415,11 +463,7 @@ proptest! {
             }
 
             let rows = conn.fetch_all(
-                &*dbg!(format!(
-                "SELECT DISTINCT {} FROM {} LIMIT 100",
-                query_model.projections.iter().map(|c|c.as_sql_code()).collect::<Vec<_>>().join(","),
-                &query_model.table.as_sql_code()
-            ))).await.unwrap();
+                &*dbg!(query_model.as_sql_code_distinct_types())).await.unwrap();
 
             for row in rows
             {
