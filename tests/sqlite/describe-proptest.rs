@@ -53,55 +53,11 @@ impl ColumnModel {
     }
 }
 
-fn my_tweet_column_strategy() -> impl Strategy<Value = ColumnModel> {
-    prop_oneof![
-        Just(ColumnModel {
-            name: "id".into(),
-            col_type: ColType::Integer,
-            nullable: false
-        }),
-        Just(ColumnModel {
-            name: "text".into(),
-            col_type: ColType::Text,
-            nullable: false
-        }),
-        Just(ColumnModel {
-            name: "is_sent".into(),
-            col_type: ColType::Boolean,
-            nullable: false
-        }),
-        Just(ColumnModel {
-            name: "owner_id".into(),
-            col_type: ColType::Integer,
-            nullable: true
-        })
-    ]
-}
-
-fn my_accounts_column_strategy() -> impl Strategy<Value = ColumnModel> {
-    prop_oneof![
-        Just(ColumnModel {
-            name: "id".into(),
-            col_type: ColType::Integer,
-            nullable: false
-        }),
-        Just(ColumnModel {
-            name: "name".into(),
-            col_type: ColType::Text,
-            nullable: false
-        }),
-        Just(ColumnModel {
-            name: "is_active".into(),
-            col_type: ColType::Boolean,
-            nullable: true
-        })
-    ]
-}
-
 #[derive(Debug, PartialEq, Hash, Clone)]
 struct TableModel {
     name: &'static str,
     output_alias: Option<String>,
+    columns: Vec<ColumnModel>,
 }
 impl TableModel {
     fn as_sql_code(&self) -> String {
@@ -119,6 +75,91 @@ impl TableModel {
             self.name.to_string()
         }
     }
+}
+
+fn my_tweet_table_info(output_alias: Option<String>) -> TableModel {
+    TableModel {
+        name: "tweet",
+        output_alias,
+        columns: vec![
+            ColumnModel {
+                name: "id".into(),
+                col_type: ColType::Integer,
+                nullable: false,
+            },
+            ColumnModel {
+                name: "text".into(),
+                col_type: ColType::Text,
+                nullable: false,
+            },
+            ColumnModel {
+                name: "is_sent".into(),
+                col_type: ColType::Boolean,
+                nullable: false,
+            },
+            ColumnModel {
+                name: "owner_id".into(),
+                col_type: ColType::Integer,
+                nullable: true,
+            },
+        ],
+    }
+}
+
+fn my_accounts_table_info(output_alias: Option<String>) -> TableModel {
+    TableModel {
+        name: "accounts",
+        output_alias,
+        columns: vec![
+            ColumnModel {
+                name: "id".into(),
+                col_type: ColType::Integer,
+                nullable: false,
+            },
+            ColumnModel {
+                name: "name".into(),
+                col_type: ColType::Text,
+                nullable: false,
+            },
+            ColumnModel {
+                name: "is_active".into(),
+                col_type: ColType::Boolean,
+                nullable: true,
+            },
+        ],
+    }
+}
+
+fn my_accounts_view_table_info(output_alias: Option<String>) -> TableModel {
+    TableModel {
+        name: "accounts_view",
+        output_alias: Some("accounts".to_string()),
+        columns: vec![
+            ColumnModel {
+                name: "id".into(),
+                col_type: ColType::Integer,
+                nullable: false,
+            },
+            ColumnModel {
+                name: "name".into(),
+                col_type: ColType::Text,
+                nullable: false,
+            },
+            ColumnModel {
+                name: "is_active".into(),
+                col_type: ColType::Boolean,
+                nullable: true,
+            },
+        ],
+    }
+}
+
+fn my_table_strategy() -> impl Strategy<Value = TableModel> {
+    prop_oneof![
+        Just(my_tweet_table_info(None)),
+        Just(my_accounts_table_info(Some("accounts".to_string()))),
+        Just(my_accounts_view_table_info(None)),
+    ]
 }
 
 #[derive(Debug, PartialEq, Hash, Clone)]
@@ -267,30 +308,32 @@ impl ExpressionModel {
     }
 }
 
-fn my_expression_model_strategy<C: 'static + Strategy<Value = ColumnModel>>(
-    table: TableModel,
-    column_strategy: C,
-) -> impl Strategy<Value = ExpressionModel> {
-    let table_projection = (prop_oneof![Just(table.as_sql_name())], column_strategy).prop_map(
-        move |(source_alias, column)| {
-            ExpressionModel::ColumnProjection(ColumnProjection {
-                source_alias,
-                column,
-            })
-        },
-    );
-
-    let literal_projection = prop_oneof![
+fn my_literal_expression_model_strategy() -> impl Strategy<Value = ExpressionModel> {
+    prop_oneof![
         Just(ExpressionModel::LiteralValue(LiteralValue::Boolean)),
         Just(ExpressionModel::LiteralValue(LiteralValue::Integer)),
         Just(ExpressionModel::LiteralValue(LiteralValue::Real)),
         Just(ExpressionModel::LiteralValue(LiteralValue::Text)),
         Just(ExpressionModel::LiteralValue(LiteralValue::Blob)),
-    ];
+    ]
+}
 
-    let leaf = prop_oneof![literal_projection, table_projection];
+fn my_table_projection_expression_model_strategy(
+    table: TableModel,
+) -> impl Strategy<Value = ExpressionModel> {
+    let column_strategy = proptest::sample::select(table.columns.clone());
+    column_strategy.prop_map(move |column: ColumnModel| {
+        ExpressionModel::ColumnProjection(ColumnProjection {
+            source_alias: table.as_sql_name(),
+            column,
+        })
+    })
+}
 
-    leaf.prop_recursive(5, 15, 2, move |inner| {
+fn my_expression_tree_strategy<E: 'static + Strategy<Value = ExpressionModel>>(
+    leaf_strategy: E,
+) -> impl Strategy<Value = ExpressionModel> {
+    leaf_strategy.prop_recursive(5, 15, 2, move |inner| {
         (
             prop_oneof![
                 Just(InfixNumericOperationType::Add),
@@ -320,19 +363,17 @@ struct QueryModel {
     pub table: TableModel,
 }
 
-fn my_query_strategy_args<
-    T: 'static + Strategy<Value = TableModel>,
-    C: 'static + Strategy<Value = ColumnModel>,
->(
+fn my_query_strategy_args<T: 'static + Strategy<Value = TableModel>>(
     table_strategy: T,
-    column_strategy: C,
 ) -> impl Strategy<Value = QueryModel> {
-    let column_strategy = std::sync::Arc::new(column_strategy);
     table_strategy.prop_flat_map(move |table| {
-        let columns_strategy = prop::collection::vec(
-            my_expression_model_strategy(table.clone(), column_strategy.clone()),
-            1..100,
-        );
+        let literal_projection = my_literal_expression_model_strategy();
+        let table_projection = my_table_projection_expression_model_strategy(table.clone());
+        let leaf_strategy = prop_oneof![literal_projection, table_projection];
+
+        let expression_model_strategy = my_expression_tree_strategy(leaf_strategy);
+        let columns_strategy = prop::collection::vec(expression_model_strategy, 1..10);
+
         columns_strategy.prop_map(move |projections| QueryModel {
             projections,
             table: table.clone(),
@@ -341,29 +382,7 @@ fn my_query_strategy_args<
 }
 
 fn my_query_strategy() -> impl Strategy<Value = QueryModel> {
-    prop_oneof![
-        my_query_strategy_args(
-            Just(TableModel {
-                name: "tweet",
-                output_alias: None
-            }),
-            my_tweet_column_strategy()
-        ),
-        my_query_strategy_args(
-            Just(TableModel {
-                name: "accounts",
-                output_alias: Some("accounts".to_string())
-            }),
-            my_accounts_column_strategy()
-        ),
-        my_query_strategy_args(
-            Just(TableModel {
-                name: "accounts_view",
-                output_alias: None
-            }),
-            my_accounts_column_strategy()
-        ),
-    ]
+    prop_oneof![my_query_strategy_args(my_table_strategy()),]
 }
 
 proptest! {
