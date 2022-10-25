@@ -334,7 +334,7 @@ fn my_table_projection_expression_model_strategy(
 
 fn my_expression_tree_strategy<E: 'static + Strategy<Value = ExpressionModel>>(
     leaf_strategy: E,
-) -> impl Strategy<Value = ExpressionModel> {
+) -> impl Strategy<Value = ExpressionModel> + Clone {
     leaf_strategy.prop_recursive(5, 15, 2, move |inner| {
         (
             prop_oneof![
@@ -360,31 +360,140 @@ fn my_expression_tree_strategy<E: 'static + Strategy<Value = ExpressionModel>>(
 }
 
 #[derive(Debug, PartialEq, Hash, Clone)]
+enum NullOrderModel {
+    Default,
+    First,
+    Last,
+}
+
+impl NullOrderModel {
+    pub fn as_sql_code(&self) -> String {
+        match self {
+            Self::Default => "",
+            Self::First => "NULLS FIRST",
+            Self::Last => "NULLS LAST",
+        }
+        .to_string()
+    }
+}
+
+#[derive(Debug, PartialEq, Hash, Clone)]
+enum OrderModel {
+    Default,
+    Asc,
+    Desc,
+}
+
+impl OrderModel {
+    pub fn as_sql_code(&self) -> String {
+        match self {
+            Self::Default => "",
+            Self::Asc => "ASC",
+            Self::Desc => "DESC",
+        }
+        .to_string()
+    }
+}
+
+#[derive(Debug, PartialEq, Hash, Clone)]
+struct OrderByExpressionModel {
+    pub expression: ExpressionModel,
+    pub order: OrderModel,
+    pub null_order: NullOrderModel,
+}
+
+impl OrderByExpressionModel {
+    pub fn as_sql_code(&self) -> String {
+        format!(
+            "{} {} {}",
+            self.expression.as_sql_code(),
+            self.order.as_sql_code(),
+            self.null_order.as_sql_code()
+        )
+    }
+}
+
+fn my_orderby_expression_strategy<E: 'static + Strategy<Value = ExpressionModel>>(
+    expression_strategy: E,
+) -> impl Strategy<Value = OrderByExpressionModel> {
+    let order_strategy = prop_oneof![
+        Just(OrderModel::Default),
+        Just(OrderModel::Asc),
+        Just(OrderModel::Desc)
+    ];
+    let null_order_strategy = prop_oneof![
+        Just(NullOrderModel::Default),
+        Just(NullOrderModel::First),
+        Just(NullOrderModel::Last)
+    ];
+    (expression_strategy, order_strategy, null_order_strategy).prop_map(
+        |(expression, order, null_order)| OrderByExpressionModel {
+            expression,
+            order,
+            null_order,
+        },
+    )
+}
+
+#[derive(Debug, PartialEq, Hash, Clone)]
+struct OrderByModel {
+    pub expressions: Vec<OrderByExpressionModel>,
+}
+
+impl OrderByModel {
+    pub fn as_sql_code(&self) -> String {
+        if !self.expressions.is_empty() {
+            format!(
+                "ORDER BY {}",
+                self.expressions
+                    .iter()
+                    .map(|c| c.as_sql_code())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        } else {
+            "".to_string()
+        }
+    }
+}
+
+fn my_orderby_strategy<E: 'static + Strategy<Value = ExpressionModel>>(
+    expression_strategy: E,
+) -> impl Strategy<Value = OrderByModel> {
+    let orderby_expression_model_strategy = my_orderby_expression_strategy(expression_strategy);
+    let all_expressions_strategy = prop::collection::vec(orderby_expression_model_strategy, 0..10);
+    all_expressions_strategy.prop_map(|expressions| OrderByModel { expressions })
+}
+
+#[derive(Debug, PartialEq, Hash, Clone)]
 struct QueryModel {
     pub projections: Vec<ExpressionModel>,
     pub table: Option<TableModel>,
+    pub orderby: OrderByModel,
 }
 
 impl QueryModel {
     pub fn as_sql_code(&self) -> String {
         if let Some(table) = &self.table {
             format!(
-                "SELECT {} FROM {}",
+                "SELECT {} FROM {} {}",
                 self.projections
                     .iter()
                     .map(|c| c.as_sql_code())
                     .collect::<Vec<_>>()
                     .join(","),
-                &table.as_sql_code()
+                &table.as_sql_code(),
+                self.orderby.as_sql_code()
             )
         } else {
             format!(
-                "SELECT {}",
+                "SELECT {} {}",
                 self.projections
                     .iter()
                     .map(|c| c.as_sql_code())
                     .collect::<Vec<_>>()
-                    .join(",")
+                    .join(","),
+                &self.orderby.as_sql_code()
             )
         }
     }
@@ -392,13 +501,14 @@ impl QueryModel {
     pub fn as_sql_code_distinct_types(&self) -> String {
         if let Some(table) = &self.table {
             format!(
-                "SELECT DISTINCT {} FROM {}",
+                "SELECT DISTINCT {} FROM {} {}",
                 self.projections
                     .iter()
                     .map(|c| c.as_sql_code())
                     .collect::<Vec<_>>()
                     .join(","),
-                &table.as_sql_code()
+                &table.as_sql_code(),
+                self.orderby.as_sql_code()
             )
         } else {
             format!(
@@ -424,11 +534,16 @@ fn my_query_strategy_args<T: 'static + Strategy<Value = Option<TableModel>>>(
         };
 
         let expression_model_strategy = my_expression_tree_strategy(leaf_strategy);
-        let columns_strategy = prop::collection::vec(expression_model_strategy, 1..10);
+        let select_columns_strategy =
+            prop::collection::vec(expression_model_strategy.clone(), 1..10);
+        let orderby_strategy = my_orderby_strategy(expression_model_strategy);
 
-        columns_strategy.prop_map(move |projections| QueryModel {
-            projections,
-            table: table.clone(),
+        (select_columns_strategy, orderby_strategy).prop_map(move |(projections, orderby)| {
+            QueryModel {
+                projections,
+                table: table.clone(),
+                orderby,
+            }
         })
     })
 }
