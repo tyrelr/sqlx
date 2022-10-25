@@ -1,6 +1,6 @@
 use proptest::prelude::*;
 use sqlx::TypeInfo;
-use sqlx::{sqlite::Sqlite, Column, Executor};
+use sqlx::{sqlite::Sqlite, Column, Executor, Row, ValueRef};
 use sqlx_test::new;
 
 //TODO: find the right balance between sqlite types vs. high-level types
@@ -372,25 +372,58 @@ proptest! {
         eprintln!("{:?}",query_model);
         let res = ::sqlx_rt::async_std::task::block_on(async{
             let mut conn = new::<Sqlite>().await.unwrap();
-            let info = conn.describe(
-                &dbg!(format!(
-                "SELECT {} FROM {}",
+            {
+                let info = conn.describe(
+                    &dbg!(format!(
+                    "SELECT {} FROM {}",
+                    query_model.projections.iter().map(|c|c.as_sql_code()).collect::<Vec<_>>().join(","),
+                    &query_model.table.as_sql_code()
+                ))).await.unwrap();
+
+                let columns = info.columns();
+
+                for (i,expr_model) in query_model.projections.iter().enumerate()
+                {
+                    let expected_column = expr_model.output_column_info();
+
+                    if let Some(expected_column_name) = expected_column.name
+                    {
+                        prop_assert_eq!(&columns[i].name(), &expected_column_name);
+                    }
+                    prop_assert_eq!(info.nullable(i), Some(expected_column.nullable));
+                    prop_assert_eq!(columns[i].type_info().name(), expected_column.col_type.name());
+                }
+            }
+
+            let rows = conn.fetch_all(
+                &*dbg!(format!(
+                "SELECT DISTINCT {} FROM {} LIMIT 100",
                 query_model.projections.iter().map(|c|c.as_sql_code()).collect::<Vec<_>>().join(","),
                 &query_model.table.as_sql_code()
             ))).await.unwrap();
 
-            let columns = info.columns();
-
-            for (i,expr_model) in query_model.projections.iter().enumerate()
+            for row in rows
             {
-                let expected_column = expr_model.output_column_info();
+                let columns = row.columns();
 
-                if let Some(expected_column_name) = expected_column.name
+                for (i,expr_model) in query_model.projections.iter().enumerate()
                 {
-                    prop_assert_eq!(&columns[i].name(), &expected_column_name);
+                   let expected_column = expr_model.output_column_info();
+                   let actual_value = row.try_get_raw(i)?;
+                   let actual_type_info = actual_value.type_info();
+
+                   if actual_type_info.name() == "NULL" {
+                       prop_assert_eq!(true, expected_column.nullable);
+                   }
+                   else if actual_type_info.name() == "INTEGER" && expected_column.col_type.name() == "BOOLEAN"
+                   {
+                       //this is acceptable, sqlite uses integers for boolean types
+                   }
+                   else
+                   {
+                       prop_assert_eq!(actual_type_info.name(), expected_column.col_type.name());
+                   }
                 }
-                prop_assert_eq!(info.nullable(i), Some(expected_column.nullable));
-                prop_assert_eq!(columns[i].type_info().name(), expected_column.col_type.name());
             }
 
             Ok(())
