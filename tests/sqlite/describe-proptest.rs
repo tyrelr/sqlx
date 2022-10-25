@@ -18,7 +18,7 @@ impl ColType {
         match self {
             ColType::Boolean => "BOOLEAN",
             ColType::Integer => "INTEGER",
-            ColType::Real => "FLOAT",
+            ColType::Real => "REAL",
             ColType::Text => "TEXT",
             ColType::Blob => "BLOB",
         }
@@ -192,7 +192,7 @@ impl InfixNumericOperationType {
             Self::Add | Self::Sub | Self::Mul | Self::Div => {
                 match (left.col_type, right.col_type) {
                     (ColType::Real, _) => ColType::Real,
-                    (ColType::Integer, ColType::Real) => ColType::Real,
+                    (_, ColType::Real) => ColType::Real,
                     _ => ColType::Integer,
                 }
             }
