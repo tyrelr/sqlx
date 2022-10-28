@@ -154,7 +154,7 @@ fn my_accounts_view_table_info() -> TableModel {
 }
 
 #[derive(Debug, PartialEq, Hash, Clone)]
-enum FromClause {
+enum FromClauseModel {
     Table {
         table: TableModel,
         output_alias: String,
@@ -166,7 +166,7 @@ enum FromClause {
     None,
 }
 
-impl FromClause {
+impl FromClauseModel {
     fn as_sql_code(&self) -> String {
         match self {
             Self::Table {
@@ -197,17 +197,17 @@ impl FromClause {
     }
 }
 
-fn my_from_clause_strategy(output_alias: String) -> impl Strategy<Value = FromClause> {
+fn my_from_clause_strategy(output_alias: String) -> impl Strategy<Value = FromClauseModel> {
     let table_strategy = prop_oneof![
         Just(my_tweet_table_info()),
         Just(my_accounts_table_info()),
         Just(my_accounts_view_table_info()),
     ];
 
-    let from_nothing_strategy = Just(FromClause::None);
+    let from_nothing_strategy = Just(FromClauseModel::None);
     let from_table_strategy =
         (Just(output_alias.clone()), table_strategy).prop_map(move |(output_alias, table)| {
-            FromClause::Table {
+            FromClauseModel::Table {
                 table,
                 output_alias,
             }
@@ -219,7 +219,7 @@ fn my_from_clause_strategy(output_alias: String) -> impl Strategy<Value = FromCl
         let output_alias = (&output_alias).clone();
         my_query_strategy_args(inner).prop_map(move |query| {
             let output_alias = output_alias.clone() + &query.table.as_sql_name();
-            FromClause::Query {
+            FromClauseModel::Query {
                 query: Box::new(query),
                 output_alias,
             }
@@ -228,14 +228,14 @@ fn my_from_clause_strategy(output_alias: String) -> impl Strategy<Value = FromCl
 }
 
 #[derive(Debug, PartialEq, Hash, Clone)]
-enum LiteralValue {
+enum LiteralValueModel {
     Boolean,
     Integer,
     Real,
     Text,
     Blob,
 }
-impl LiteralValue {
+impl LiteralValueModel {
     fn as_sql_code(&self) -> String {
         match self {
             Self::Boolean => "true",
@@ -263,11 +263,11 @@ impl LiteralValue {
 }
 
 #[derive(Debug, PartialEq, Hash, Clone)]
-struct ColumnProjection {
+struct ColumnProjectionModel {
     source_alias: String,
     column: ColumnModel,
 }
-impl ColumnProjection {
+impl ColumnProjectionModel {
     fn as_sql_code(&self) -> String {
         format!("{}.{}", self.source_alias, self.column.as_sql_code())
     }
@@ -318,13 +318,13 @@ impl InfixNumericOperationType {
 }
 
 #[derive(Debug, PartialEq, Hash, Clone)]
-struct InfixNumericOperation {
+struct InfixNumericOperationModel {
     operation: InfixNumericOperationType,
     left: ExpressionModel,
     right: ExpressionModel,
 }
 
-impl InfixNumericOperation {
+impl InfixNumericOperationModel {
     fn as_sql_code(&self) -> String {
         format!(
             "({} {} {})",
@@ -350,9 +350,9 @@ impl InfixNumericOperation {
 
 #[derive(Debug, PartialEq, Hash, Clone)]
 enum ExpressionModel {
-    LiteralValue(LiteralValue),
-    ColumnProjection(ColumnProjection),
-    InfixNumericOperation(Box<InfixNumericOperation>),
+    LiteralValue(LiteralValueModel),
+    ColumnProjection(ColumnProjectionModel),
+    InfixNumericOperation(Box<InfixNumericOperationModel>),
 }
 
 impl ExpressionModel {
@@ -375,16 +375,16 @@ impl ExpressionModel {
 
 fn my_literal_expression_model_strategy() -> impl Strategy<Value = ExpressionModel> {
     prop_oneof![
-        Just(ExpressionModel::LiteralValue(LiteralValue::Boolean)),
-        Just(ExpressionModel::LiteralValue(LiteralValue::Integer)),
-        Just(ExpressionModel::LiteralValue(LiteralValue::Real)),
-        Just(ExpressionModel::LiteralValue(LiteralValue::Text)),
-        Just(ExpressionModel::LiteralValue(LiteralValue::Blob)),
+        Just(ExpressionModel::LiteralValue(LiteralValueModel::Boolean)),
+        Just(ExpressionModel::LiteralValue(LiteralValueModel::Integer)),
+        Just(ExpressionModel::LiteralValue(LiteralValueModel::Real)),
+        Just(ExpressionModel::LiteralValue(LiteralValueModel::Text)),
+        Just(ExpressionModel::LiteralValue(LiteralValueModel::Blob)),
     ]
 }
 
 fn my_table_projection_expression_model_strategy(
-    from_clause: &FromClause,
+    from_clause: &FromClauseModel,
 ) -> Option<impl Strategy<Value = ExpressionModel>> {
     let column_models: Vec<ColumnModel> = from_clause
         .output_column_info()
@@ -399,7 +399,7 @@ fn my_table_projection_expression_model_strategy(
         let source_alias = from_clause.as_sql_name();
         let result = (Just(source_alias), column_strategy).prop_map(
             move |(source_alias, column): (String, ColumnModel)| {
-                ExpressionModel::ColumnProjection(ColumnProjection {
+                ExpressionModel::ColumnProjection(ColumnProjectionModel {
                     source_alias,
                     column,
                 })
@@ -425,7 +425,7 @@ fn my_expression_tree_strategy<E: 'static + Strategy<Value = ExpressionModel>>(
         )
             .prop_map(move |(operation, expr1, expr2)| {
                 ExpressionModel::InfixNumericOperation(
-                    InfixNumericOperation {
+                    InfixNumericOperationModel {
                         operation,
                         left: expr1,
                         right: expr2,
@@ -545,7 +545,7 @@ fn my_orderby_strategy<E: 'static + Strategy<Value = ExpressionModel>>(
 #[derive(Debug, PartialEq, Hash, Clone)]
 struct QueryModel {
     pub projections: Vec<ExpressionModel>,
-    pub table: FromClause,
+    pub table: FromClauseModel,
     pub orderby: OrderByModel,
 }
 
@@ -575,7 +575,7 @@ impl QueryModel {
     }
 }
 
-fn my_query_strategy_args<T: 'static + Strategy<Value = FromClause>>(
+fn my_query_strategy_args<T: 'static + Strategy<Value = FromClauseModel>>(
     table_strategy: T,
 ) -> impl Strategy<Value = QueryModel> {
     table_strategy.prop_flat_map(move |table| {
