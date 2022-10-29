@@ -160,7 +160,7 @@ struct OutputColumnInfo {
 }
 
 #[derive(Debug, PartialEq, Hash, Clone)]
-enum FromClauseModel {
+enum FromClauseLeafModel {
     Table {
         table: TableModel,
         output_alias: String,
@@ -171,7 +171,7 @@ enum FromClauseModel {
     },
 }
 
-impl FromClauseModel {
+impl FromClauseLeafModel {
     fn as_sql_code(&self) -> String {
         match self {
             Self::Table {
@@ -214,7 +214,8 @@ impl FromClauseModel {
     }
 }
 
-fn unique_alias_strategy(used_alias_list: Vec<String>) -> impl Strategy<Value = String> {
+fn unique_alias_strategy(used_alias_list: &[String]) -> impl Strategy<Value = String> {
+    let used_alias_list: Vec<String> = used_alias_list.iter().cloned().collect();
     proptest::string::string_regex("[A-Za-z]{1,3}")
         .unwrap()
         .prop_filter("alias must be unique", move |s| {
@@ -222,33 +223,99 @@ fn unique_alias_strategy(used_alias_list: Vec<String>) -> impl Strategy<Value = 
         })
 }
 
-fn my_from_clause_strategy(used_alias_list: Vec<String>) -> impl Strategy<Value = FromClauseModel> {
+fn my_from_clause_leaf_strategy(
+    used_alias_list: &[String],
+) -> impl Strategy<Value = FromClauseLeafModel> {
     let table_strategy = prop_oneof![
         Just(my_tweet_table_info()),
         Just(my_accounts_table_info()),
         Just(my_accounts_view_table_info()),
     ];
 
-    let alias_strategy = unique_alias_strategy(used_alias_list.clone());
+    let alias_strategy = unique_alias_strategy(used_alias_list);
     let from_table_strategy =
         (alias_strategy, table_strategy).prop_map(move |(output_alias, table)| {
-            FromClauseModel::Table {
+            FromClauseLeafModel::Table {
                 table,
                 output_alias,
             }
         });
 
+    let used_alias_list: Vec<_> = used_alias_list.iter().cloned().collect();
     from_table_strategy.prop_recursive(4, 3, 1, move |from_clause| {
-        let alias_strategy = unique_alias_strategy(used_alias_list.clone());
+        let alias_strategy = unique_alias_strategy(&used_alias_list);
         (
             alias_strategy,
-            my_query_strategy_args(proptest::option::of(from_clause)),
+            my_query_strategy_args(
+                &used_alias_list,
+                proptest::option::of(my_from_clause_strategy(from_clause, &used_alias_list)),
+            ),
         )
-            .prop_map(move |(output_alias, query)| FromClauseModel::Query {
+            .prop_map(move |(output_alias, query)| FromClauseLeafModel::Query {
                 query: Box::new(query),
                 output_alias,
             })
     })
+}
+
+#[derive(Debug, PartialEq, Hash, Clone, Copy)]
+enum JoinConditionModel {
+    Cross,
+}
+
+impl JoinConditionModel {
+    fn join_as_sql_code(&self) -> String {
+        "CROSS JOIN".to_string()
+    }
+    fn condition_as_sql_code(&self) -> String {
+        String::new()
+    }
+}
+
+#[derive(Debug, PartialEq, Hash, Clone)]
+enum FromJoinClauseModel {
+    FromClause(FromClauseLeafModel),
+    JoinClause {
+        first: Box<FromJoinClauseModel>,
+        second: FromClauseLeafModel,
+        join_condition: JoinConditionModel,
+    },
+}
+
+impl FromJoinClauseModel {
+    fn as_sql_code(&self) -> String {
+        match self {
+            Self::FromClause(from) => from.as_sql_code(),
+            Self::JoinClause {
+                first,
+                second,
+                join_condition,
+            } => format!(
+                "{} {} {} {}",
+                first.as_sql_code(),
+                join_condition.join_as_sql_code(),
+                second.as_sql_code(),
+                join_condition.condition_as_sql_code()
+            ),
+        }
+    }
+    fn output_column_info(&self) -> Vec<OutputColumnInfo> {
+        match self {
+            Self::FromClause(from) => from.output_column_info(),
+            Self::JoinClause { first, second, .. } => {
+                let mut columns = first.output_column_info();
+                columns.extend(second.output_column_info());
+                columns
+            }
+        }
+    }
+}
+
+fn my_from_clause_strategy<T: Strategy<Value = FromClauseLeafModel>>(
+    from_clause_strategy: T,
+    used_alias_list: &[String],
+) -> impl Strategy<Value = FromJoinClauseModel> {
+    from_clause_strategy.prop_map(FromJoinClauseModel::FromClause)
 }
 
 #[derive(Debug, PartialEq, Hash, Clone)]
@@ -426,7 +493,7 @@ fn my_literal_expression_model_strategy() -> impl Strategy<Value = ExpressionMod
 }
 
 fn my_option_table_projection_expression_model_strategy(
-    from_clause: &Option<FromClauseModel>,
+    from_clause: &Option<FromJoinClauseModel>,
 ) -> Option<impl Strategy<Value = ExpressionModel>> {
     match from_clause {
         Some(from_clause) => my_table_projection_expression_model_strategy(from_clause),
@@ -434,7 +501,7 @@ fn my_option_table_projection_expression_model_strategy(
     }
 }
 fn my_table_projection_expression_model_strategy(
-    from_clause: &FromClauseModel,
+    from_clause: &FromJoinClauseModel,
 ) -> Option<impl Strategy<Value = ExpressionModel>> {
     let column_models: Vec<ColumnProjectionModel> = from_clause
         .output_column_info()
@@ -585,7 +652,7 @@ fn my_orderby_strategy<E: 'static + Strategy<Value = ExpressionModel>>(
 #[derive(Debug, PartialEq, Hash, Clone)]
 struct QueryModel {
     pub projections: Vec<ExpressionModel>,
-    pub from: Option<FromClauseModel>,
+    pub from: Option<FromJoinClauseModel>,
     pub orderby: OrderByModel,
 }
 
@@ -618,10 +685,11 @@ impl QueryModel {
     }
 }
 
-fn my_query_strategy_args<T: 'static + Strategy<Value = Option<FromClauseModel>>>(
-    table_strategy: T,
+fn my_query_strategy_args<T: 'static + Strategy<Value = Option<FromJoinClauseModel>>>(
+    used_alias_list: &[String],
+    from_clause_strategy: T,
 ) -> impl Strategy<Value = QueryModel> {
-    table_strategy.prop_flat_map(move |from_clause| {
+    from_clause_strategy.prop_flat_map(move |from_clause| {
         let table_column_strategy =
             my_option_table_projection_expression_model_strategy(&from_clause);
 
@@ -651,9 +719,10 @@ fn my_query_strategy_args<T: 'static + Strategy<Value = Option<FromClauseModel>>
 }
 
 fn my_query_strategy(used_alias_list: Vec<String>) -> impl Strategy<Value = QueryModel> {
-    my_query_strategy_args(proptest::option::of(my_from_clause_strategy(
-        used_alias_list,
-    )))
+    let from_clause_leaf = my_from_clause_leaf_strategy(&used_alias_list);
+    let from_clause_strategy =
+        proptest::option::of(my_from_clause_strategy(from_clause_leaf, &used_alias_list));
+    my_query_strategy_args(&used_alias_list, from_clause_strategy)
 }
 
 proptest! {
