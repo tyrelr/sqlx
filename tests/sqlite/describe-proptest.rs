@@ -41,7 +41,7 @@ struct ColumnModel {
 
 impl ColumnModel {
     fn as_sql_code(&self) -> String {
-        self.name.to_string()
+        format!("\"{}\"", self.name)
     }
 
     fn to_column_info(&self) -> ColumnInfo {
@@ -75,7 +75,7 @@ struct TableModel {
 }
 impl TableModel {
     fn as_sql_code(&self) -> String {
-        self.name.to_string()
+        format!("\"{}\"", self.name.to_string())
     }
 }
 
@@ -154,6 +154,12 @@ fn my_accounts_view_table_info() -> TableModel {
 }
 
 #[derive(Debug, PartialEq, Hash, Clone)]
+struct OutputColumnInfo {
+    pub output_alias: String,
+    pub column_info: ColumnInfo,
+}
+
+#[derive(Debug, PartialEq, Hash, Clone)]
 enum FromClauseModel {
     Table {
         table: TableModel,
@@ -172,32 +178,54 @@ impl FromClauseModel {
             Self::Table {
                 table,
                 output_alias,
-            } => format!("FROM {} {}", table.as_sql_code(), output_alias),
+            } => format!("FROM {} \"{}\"", table.as_sql_code(), output_alias),
             Self::Query {
                 query,
                 output_alias,
-            } => format!("FROM ({}) {}", query.as_sql_code(), output_alias),
+            } => format!("FROM ({}) \"{}\"", query.as_sql_code(), output_alias),
             Self::None => String::new(),
         }
     }
-
-    fn output_column_info(&self) -> Vec<ColumnInfo> {
+    fn output_column_info(&self) -> Vec<OutputColumnInfo> {
         match self {
-            Self::Table { table, .. } => table.columns.iter().map(|c| c.to_column_info()).collect(),
-            Self::Query { query, .. } => query.output_column_info(),
+            Self::Table {
+                table,
+                output_alias,
+            } => table
+                .columns
+                .iter()
+                .cloned()
+                .map(|c| OutputColumnInfo {
+                    output_alias: output_alias.clone(),
+                    column_info: c.to_column_info(),
+                })
+                .collect(),
+            Self::Query {
+                query,
+                output_alias,
+            } => query
+                .output_column_info()
+                .iter()
+                .cloned()
+                .map(|column_info| OutputColumnInfo {
+                    output_alias: output_alias.clone(),
+                    column_info,
+                })
+                .collect(),
             Self::None => Vec::new(),
-        }
-    }
-    fn as_sql_name(&self) -> String {
-        match self {
-            Self::Table { output_alias, .. } => output_alias.to_string(),
-            Self::Query { output_alias, .. } => output_alias.to_string(),
-            Self::None => String::new(), //TODO: eliminate need for as_sql_name()
         }
     }
 }
 
-fn my_from_clause_strategy(output_alias: String) -> impl Strategy<Value = FromClauseModel> {
+fn unique_alias_strategy(used_alias_list: Vec<String>) -> impl Strategy<Value = String> {
+    proptest::string::string_regex("[A-Za-z]{1,3}")
+        .unwrap()
+        .prop_filter("alias must be unique", move |s| {
+            !used_alias_list.contains(s)
+        })
+}
+
+fn my_from_clause_strategy(used_alias_list: Vec<String>) -> impl Strategy<Value = FromClauseModel> {
     let table_strategy = prop_oneof![
         Just(my_tweet_table_info()),
         Just(my_accounts_table_info()),
@@ -205,8 +233,9 @@ fn my_from_clause_strategy(output_alias: String) -> impl Strategy<Value = FromCl
     ];
 
     let from_nothing_strategy = Just(FromClauseModel::None);
+    let alias_strategy = unique_alias_strategy(used_alias_list.clone());
     let from_table_strategy =
-        (Just(output_alias.clone()), table_strategy).prop_map(move |(output_alias, table)| {
+        (alias_strategy, table_strategy).prop_map(move |(output_alias, table)| {
             FromClauseModel::Table {
                 table,
                 output_alias,
@@ -216,9 +245,8 @@ fn my_from_clause_strategy(output_alias: String) -> impl Strategy<Value = FromCl
     let leaf_strategy = prop_oneof![from_nothing_strategy, from_table_strategy,];
 
     leaf_strategy.prop_recursive(15, 2, 2, move |inner| {
-        let output_alias = (&output_alias).clone();
-        my_query_strategy_args(inner).prop_map(move |query| {
-            let output_alias = output_alias.clone() + &query.table.as_sql_name();
+        let alias_strategy = unique_alias_strategy(used_alias_list.clone());
+        (alias_strategy, my_query_strategy_args(inner)).prop_map(move |(output_alias, query)| {
             FromClauseModel::Query {
                 query: Box::new(query),
                 output_alias,
@@ -269,11 +297,29 @@ struct ColumnProjectionModel {
 }
 impl ColumnProjectionModel {
     fn as_sql_code(&self) -> String {
-        format!("{}.{}", self.source_alias, self.column.as_sql_code())
+        format!("\"{}\".{}", self.source_alias, self.column.as_sql_code())
     }
 
     fn output_column_info(&self) -> ColumnInfo {
         self.column.to_column_info()
+    }
+}
+
+impl std::convert::TryFrom<&OutputColumnInfo> for ColumnProjectionModel {
+    type Error = ();
+    fn try_from(value: &OutputColumnInfo) -> Result<Self, ()> {
+        if let Some(name) = value.column_info.name {
+            Ok(Self {
+                source_alias: value.output_alias.clone(),
+                column: ColumnModel {
+                    name,
+                    col_type: value.column_info.col_type,
+                    nullable: value.column_info.nullable,
+                },
+            })
+        } else {
+            Err(())
+        }
     }
 }
 
@@ -386,7 +432,7 @@ fn my_literal_expression_model_strategy() -> impl Strategy<Value = ExpressionMod
 fn my_table_projection_expression_model_strategy(
     from_clause: &FromClauseModel,
 ) -> Option<impl Strategy<Value = ExpressionModel>> {
-    let column_models: Vec<ColumnModel> = from_clause
+    let column_models: Vec<ColumnProjectionModel> = from_clause
         .output_column_info()
         .iter()
         .filter_map(|c| c.try_into().ok())
@@ -395,17 +441,7 @@ fn my_table_projection_expression_model_strategy(
     if column_models.is_empty() {
         None
     } else {
-        let column_strategy = proptest::sample::select(column_models);
-        let source_alias = from_clause.as_sql_name();
-        let result = (Just(source_alias), column_strategy).prop_map(
-            move |(source_alias, column): (String, ColumnModel)| {
-                ExpressionModel::ColumnProjection(ColumnProjectionModel {
-                    source_alias,
-                    column,
-                })
-            },
-        );
-        Some(result)
+        Some(proptest::sample::select(column_models).prop_map(ExpressionModel::ColumnProjection))
     }
 }
 
@@ -605,13 +641,13 @@ fn my_query_strategy_args<T: 'static + Strategy<Value = FromClauseModel>>(
     })
 }
 
-fn my_query_strategy(alias: String) -> impl Strategy<Value = QueryModel> {
-    my_query_strategy_args(my_from_clause_strategy(alias.clone()))
+fn my_query_strategy(used_alias_list: Vec<String>) -> impl Strategy<Value = QueryModel> {
+    my_query_strategy_args(my_from_clause_strategy(used_alias_list))
 }
 
 proptest! {
     #[test]
-    fn describe_query_prop_test(query_model in my_query_strategy("a".to_string())) {
+    fn describe_query_prop_test(query_model in my_query_strategy(vec![])) {
         eprintln!("{:?}",query_model);
         let res = ::sqlx_rt::async_std::task::block_on(async{
             let mut conn = new::<Sqlite>().await.unwrap();
