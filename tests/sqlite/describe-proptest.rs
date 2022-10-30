@@ -177,11 +177,11 @@ impl FromClauseLeafModel {
             Self::Table {
                 table,
                 output_alias,
-            } => format!("FROM {} \"{}\"", table.as_sql_code(), output_alias),
+            } => format!("{} \"{}\"", table.as_sql_code(), output_alias),
             Self::Query {
                 query,
                 output_alias,
-            } => format!("FROM ({}) \"{}\"", query.as_sql_code(), output_alias),
+            } => format!("({}) \"{}\"", query.as_sql_code(), output_alias),
         }
     }
     fn output_column_info(&self) -> Vec<OutputColumnInfo> {
@@ -212,6 +212,13 @@ impl FromClauseLeafModel {
                 .collect(),
         }
     }
+    fn output_alias(&self) -> String {
+        match self {
+            Self::Table { output_alias, .. } => output_alias,
+            Self::Query { output_alias, .. } => output_alias,
+        }
+        .clone()
+    }
 }
 
 fn unique_alias_strategy(used_alias_list: &[String]) -> impl Strategy<Value = String> {
@@ -225,7 +232,8 @@ fn unique_alias_strategy(used_alias_list: &[String]) -> impl Strategy<Value = St
 
 fn my_from_clause_leaf_strategy(
     used_alias_list: &[String],
-) -> impl Strategy<Value = FromClauseLeafModel> {
+    max_subquery_depth: u8,
+) -> impl Strategy<Value = FromClauseLeafModel> + Clone {
     let table_strategy = prop_oneof![
         Just(my_tweet_table_info()),
         Just(my_accounts_table_info()),
@@ -241,21 +249,27 @@ fn my_from_clause_leaf_strategy(
             }
         });
 
-    let used_alias_list: Vec<_> = used_alias_list.iter().cloned().collect();
-    from_table_strategy.prop_recursive(4, 3, 1, move |from_clause| {
-        let alias_strategy = unique_alias_strategy(&used_alias_list);
-        (
-            alias_strategy,
+    if max_subquery_depth == 0 {
+        from_table_strategy.boxed()
+    } else {
+        let from_subquery_strategy = (
             my_query_strategy_args(
                 &used_alias_list,
-                proptest::option::of(my_from_clause_strategy(from_clause, &used_alias_list)),
+                proptest::option::of(my_from_clause_strategy(
+                    &used_alias_list,
+                    max_subquery_depth - 1,
+                )),
+                max_subquery_depth,
             ),
+            unique_alias_strategy(&used_alias_list),
         )
-            .prop_map(move |(output_alias, query)| FromClauseLeafModel::Query {
+            .prop_map(|(query, output_alias)| FromClauseLeafModel::Query {
                 query: Box::new(query),
                 output_alias,
-            })
-    })
+            });
+
+        prop_oneof![from_table_strategy, from_subquery_strategy].boxed()
+    }
 }
 
 #[derive(Debug, PartialEq, Hash, Clone, Copy)]
@@ -285,7 +299,7 @@ enum FromJoinClauseModel {
 impl FromJoinClauseModel {
     fn as_sql_code(&self) -> String {
         match self {
-            Self::FromClause(from) => from.as_sql_code(),
+            Self::FromClause(from) => format!("FROM {}", from.as_sql_code()),
             Self::JoinClause {
                 first,
                 second,
@@ -311,11 +325,49 @@ impl FromJoinClauseModel {
     }
 }
 
-fn my_from_clause_strategy<T: Strategy<Value = FromClauseLeafModel>>(
-    from_clause_strategy: T,
+fn my_join_clause_strategy(
+    (used_alias_list, first, max_subquery_depth): (Vec<String>, FromJoinClauseModel, u8),
+) -> impl Strategy<Value = (Vec<String>, FromJoinClauseModel, u8)> {
+    let second_from_strategy = my_from_clause_leaf_strategy(&used_alias_list, max_subquery_depth);
+    (Just(first), Just(used_alias_list), second_from_strategy).prop_map(
+        move |(first, used_alias_list, second)| {
+            let mut used_alias_list_b: Vec<String> = used_alias_list.clone();
+            used_alias_list_b.push(second.output_alias());
+            (
+                used_alias_list_b,
+                FromJoinClauseModel::JoinClause {
+                    first: Box::new(first.clone()),
+                    second,
+                    join_condition: JoinConditionModel::Cross,
+                },
+                max_subquery_depth,
+            )
+        },
+    )
+}
+
+fn my_from_clause_strategy(
     used_alias_list: &[String],
+    max_subquery_depth: u8,
 ) -> impl Strategy<Value = FromJoinClauseModel> {
-    from_clause_strategy.prop_map(FromJoinClauseModel::FromClause)
+    let mut used_alias_list: Vec<String> = used_alias_list.to_owned();
+    let first_from_strategy = my_from_clause_leaf_strategy(&used_alias_list, max_subquery_depth);
+    let leaf = (Just(used_alias_list.clone()), first_from_strategy).prop_map(
+        move |(used_alias_list, table)| {
+            let mut used_alias_list_b: Vec<String> = used_alias_list.clone();
+            used_alias_list_b.push(table.output_alias());
+            (
+                used_alias_list_b,
+                FromJoinClauseModel::FromClause(table),
+                max_subquery_depth,
+            )
+        },
+    );
+
+    leaf.prop_recursive(3, 2, 1, move |first_strategy| {
+        first_strategy.prop_flat_map(my_join_clause_strategy)
+    })
+    .prop_map(|(_, join, _)| join)
 }
 
 #[derive(Debug, PartialEq, Hash, Clone)]
@@ -519,27 +571,20 @@ fn my_table_projection_expression_model_strategy(
 fn my_expression_tree_strategy<E: 'static + Strategy<Value = ExpressionModel>>(
     leaf_strategy: E,
 ) -> impl Strategy<Value = ExpressionModel> + Clone {
-    leaf_strategy.prop_recursive(5, 15, 2, move |inner| {
-        (
-            prop_oneof![
-                Just(InfixNumericOperationType::Add),
-                Just(InfixNumericOperationType::Sub),
-                Just(InfixNumericOperationType::Mul),
-                //Just(InfixNumericOperationType::Div) //TODO: dividing by strings acts weird, sqlx doesn't implement that. ex: SELECT 1/"a"; -> null
-            ],
-            inner.clone(),
-            inner.clone(),
-        )
-            .prop_map(move |(operation, expr1, expr2)| {
-                ExpressionModel::InfixNumericOperation(
-                    InfixNumericOperationModel {
-                        operation,
-                        left: expr1,
-                        right: expr2,
-                    }
-                    .into(),
-                )
-            })
+    leaf_strategy.prop_recursive(5, 15, 2, move |leaf| {
+        let operation_strategy = std::sync::Arc::new(prop_oneof![
+            Just(InfixNumericOperationType::Add),
+            Just(InfixNumericOperationType::Sub),
+            Just(InfixNumericOperationType::Mul),
+            //Just(InfixNumericOperationType::Div) //TODO: dividing by strings acts weird, sqlx doesn't implement that. ex: SELECT 1/"a"; -> null
+        ]);
+        (operation_strategy, leaf.clone(), leaf).prop_map(move |(operation, left, right)| {
+            ExpressionModel::InfixNumericOperation(Box::new(InfixNumericOperationModel {
+                operation,
+                left,
+                right,
+            }))
+        })
     })
 }
 
@@ -688,12 +733,13 @@ impl QueryModel {
 fn my_query_strategy_args<T: 'static + Strategy<Value = Option<FromJoinClauseModel>>>(
     used_alias_list: &[String],
     from_clause_strategy: T,
+    max_subquery_depth: u8,
 ) -> impl Strategy<Value = QueryModel> {
     from_clause_strategy.prop_flat_map(move |from_clause| {
         let table_column_strategy =
             my_option_table_projection_expression_model_strategy(&from_clause);
 
-        let leaf_strategy = if let Some(table_column_strategy) = table_column_strategy {
+        let expression_leaf_strategy = if let Some(table_column_strategy) = table_column_strategy {
             prop_oneof![
                 my_literal_expression_model_strategy(),
                 table_column_strategy
@@ -703,7 +749,7 @@ fn my_query_strategy_args<T: 'static + Strategy<Value = Option<FromJoinClauseMod
             my_literal_expression_model_strategy().boxed()
         };
 
-        let expression_model_strategy = my_expression_tree_strategy(leaf_strategy);
+        let expression_model_strategy = my_expression_tree_strategy(expression_leaf_strategy);
         let select_columns_strategy =
             prop::collection::vec(expression_model_strategy.clone(), 1..3);
         let orderby_strategy = my_orderby_strategy(expression_model_strategy);
@@ -718,16 +764,21 @@ fn my_query_strategy_args<T: 'static + Strategy<Value = Option<FromJoinClauseMod
     })
 }
 
-fn my_query_strategy(used_alias_list: Vec<String>) -> impl Strategy<Value = QueryModel> {
-    let from_clause_leaf = my_from_clause_leaf_strategy(&used_alias_list);
-    let from_clause_strategy =
-        proptest::option::of(my_from_clause_strategy(from_clause_leaf, &used_alias_list));
-    my_query_strategy_args(&used_alias_list, from_clause_strategy)
+fn my_query_strategy(
+    used_alias_list: Vec<String>,
+    max_subquery_depth: u8,
+) -> impl Strategy<Value = QueryModel> {
+    let from_clause_strategy = proptest::option::of(my_from_clause_strategy(
+        &used_alias_list,
+        max_subquery_depth,
+    ));
+
+    my_query_strategy_args(&used_alias_list, from_clause_strategy, max_subquery_depth)
 }
 
 proptest! {
     #[test]
-    fn describe_query_prop_test(query_model in my_query_strategy(vec![])) {
+    fn describe_query_prop_test(query_model in my_query_strategy(vec![],3)) {
         eprintln!("{:?}",query_model);
         let res = ::sqlx_rt::async_std::task::block_on(async{
             let mut conn = new::<Sqlite>().await.unwrap();
