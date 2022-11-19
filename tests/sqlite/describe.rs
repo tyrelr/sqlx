@@ -531,6 +531,75 @@ async fn it_describes_table_order_by() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn assert_describe_matches_results(
+    conn: &mut sqlx::SqliteConnection,
+    query: &str,
+    columns_debug: Vec<String>, //string to explain the column if assertion fails
+) -> anyhow::Result<()> {
+    use sqlx::{Row, ValueRef};
+    let explain_result = conn.describe(query).await?;
+    let rows = conn.fetch_all(query).await?;
+    for row in rows {
+        for i in 0..columns_debug.len() {
+            let described_type = explain_result.column(i);
+            let described_nullable = explain_result.nullable(i);
+            let actual_value = row.try_get_raw(i)?;
+            let actual_type_info = actual_value.type_info();
+            let column_debug = &columns_debug[i];
+
+            if actual_type_info.name() == "NULL" {
+                assert_eq!(
+                    Some(true),
+                    described_nullable.or(Some(true)),
+                    "Column:{column_debug:?} for Query:{query}"
+                );
+            } else if actual_type_info.name() == "INTEGER" && described_type.name() == "BOOLEAN" {
+                //this is acceptable, sqlite uses integers for boolean types
+            } else {
+                assert_eq!(
+                    actual_type_info.name(),
+                    described_type.type_info().name(),
+                    "Column:{column_debug} for Query:{query}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[sqlx_macros::test]
+async fn it_describes_mathematical_coercion() -> anyhow::Result<()> {
+    let mut conn = new::<Sqlite>().await?;
+    conn.execute(concat!("CREATE TEMPORARY TABLE IF NOT EXISTS all_types(integer integer, real real, text text, blob blob);",
+    "INSERT INTO ALL_TYPES(integer, real, text, blob) VALUES (null, null, null, null);",
+    "INSERT INTO ALL_TYPES(integer, real, text, blob) VALUES (1, 1.0, '1', x'01');",
+    "INSERT INTO ALL_TYPES(integer, real, text, blob) VALUES (0, 0.0, '0', x'00');",
+    "INSERT INTO ALL_TYPES(integer, real, text, blob) VALUES (-1, -1.0, 'a', x'ef');")).await?;
+
+    for op in ["+" /*, "*", "/", "-", "||"*/] {
+        let mut columns: Vec<String> = Vec::new();
+        for left_type in ["integer", "real", "text", "blob"] {
+            for right_type in ["integer", "real", "text", "blob"] {
+                columns.push(format!("ltp.\"{left_type}\" {op} rtp.\"{right_type}\""));
+            }
+        }
+
+        let columns_str = columns.join(", ");
+        let query = format!(
+            "SELECT {columns_str}
+            from all_types ltp
+            cross join all_types rtp
+            order by coalesce(
+                ltp.integer, ltp.real, ltp.text, ltp.blob,
+                rtp.integer, rtp.real, rtp.text, rtp.blob
+                ) nulls first"
+        ); //the order by clause tries to prevent sqlx from sampling query type from the first row
+        assert_describe_matches_results(&mut conn, &query, columns).await?;
+    }
+
+    Ok(())
+}
+
 #[sqlx_macros::test]
 async fn it_describes_union() -> anyhow::Result<()> {
     async fn assert_union_described(
