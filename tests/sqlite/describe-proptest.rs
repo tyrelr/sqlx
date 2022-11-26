@@ -53,34 +53,35 @@ impl ColumnModel {
     }
 }
 
+impl std::convert::TryFrom<&ColumnInfo> for ColumnModel {
+    type Error = ();
+    fn try_from(value: &ColumnInfo) -> Result<ColumnModel, ()> {
+        if let Some(name) = value.name {
+            Ok(ColumnModel {
+                name,
+                col_type: value.col_type,
+                nullable: value.nullable,
+            })
+        } else {
+            Err(())
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Hash, Clone)]
 struct TableModel {
     name: &'static str,
-    output_alias: Option<String>,
     columns: Vec<ColumnModel>,
 }
 impl TableModel {
     fn as_sql_code(&self) -> String {
-        if let Some(output_alias) = &self.output_alias {
-            format!("{} {}", self.name, output_alias)
-        } else {
-            self.name.to_string()
-        }
-    }
-
-    fn as_sql_name(&self) -> String {
-        if let Some(output_alias) = &self.output_alias {
-            output_alias.to_string()
-        } else {
-            self.name.to_string()
-        }
+        self.name.to_string()
     }
 }
 
-fn my_tweet_table_info(output_alias: Option<String>) -> TableModel {
+fn my_tweet_table_info() -> TableModel {
     TableModel {
         name: "tweet",
-        output_alias,
         columns: vec![
             ColumnModel {
                 name: "id".into(),
@@ -106,10 +107,9 @@ fn my_tweet_table_info(output_alias: Option<String>) -> TableModel {
     }
 }
 
-fn my_accounts_table_info(output_alias: Option<String>) -> TableModel {
+fn my_accounts_table_info() -> TableModel {
     TableModel {
         name: "accounts",
-        output_alias,
         columns: vec![
             ColumnModel {
                 name: "id".into(),
@@ -130,10 +130,9 @@ fn my_accounts_table_info(output_alias: Option<String>) -> TableModel {
     }
 }
 
-fn my_accounts_view_table_info(output_alias: Option<String>) -> TableModel {
+fn my_accounts_view_table_info() -> TableModel {
     TableModel {
         name: "accounts_view",
-        output_alias: Some("accounts".to_string()),
         columns: vec![
             ColumnModel {
                 name: "id".into(),
@@ -154,12 +153,78 @@ fn my_accounts_view_table_info(output_alias: Option<String>) -> TableModel {
     }
 }
 
-fn my_table_strategy() -> impl Strategy<Value = TableModel> {
-    prop_oneof![
-        Just(my_tweet_table_info(None)),
-        Just(my_accounts_table_info(Some("accounts".to_string()))),
-        Just(my_accounts_view_table_info(None)),
-    ]
+#[derive(Debug, PartialEq, Hash, Clone)]
+enum FromClause {
+    Table {
+        table: TableModel,
+        output_alias: String,
+    },
+    Query {
+        query: Box<QueryModel>,
+        output_alias: String,
+    },
+    None,
+}
+
+impl FromClause {
+    fn as_sql_code(&self) -> String {
+        match self {
+            Self::Table {
+                table,
+                output_alias,
+            } => format!("FROM {} {}", table.as_sql_code(), output_alias),
+            Self::Query {
+                query,
+                output_alias,
+            } => format!("FROM ({}) {}", query.as_sql_code(), output_alias),
+            Self::None => String::new(),
+        }
+    }
+
+    fn output_column_info(&self) -> Vec<ColumnInfo> {
+        match self {
+            Self::Table { table, .. } => table.columns.iter().map(|c| c.to_column_info()).collect(),
+            Self::Query { query, .. } => query.output_column_info(),
+            Self::None => Vec::new(),
+        }
+    }
+    fn as_sql_name(&self) -> String {
+        match self {
+            Self::Table { output_alias, .. } => output_alias.to_string(),
+            Self::Query { output_alias, .. } => output_alias.to_string(),
+            Self::None => String::new(), //TODO: eliminate need for as_sql_name()
+        }
+    }
+}
+
+fn my_from_clause_strategy(output_alias: String) -> impl Strategy<Value = FromClause> {
+    let table_strategy = prop_oneof![
+        Just(my_tweet_table_info()),
+        Just(my_accounts_table_info()),
+        Just(my_accounts_view_table_info()),
+    ];
+
+    let from_nothing_strategy = Just(FromClause::None);
+    let from_table_strategy =
+        (Just(output_alias.clone()), table_strategy).prop_map(move |(output_alias, table)| {
+            FromClause::Table {
+                table,
+                output_alias,
+            }
+        });
+
+    let leaf_strategy = prop_oneof![from_nothing_strategy, from_table_strategy,];
+
+    leaf_strategy.prop_recursive(15, 2, 2, move |inner| {
+        let output_alias = (&output_alias).clone();
+        my_query_strategy_args(inner).prop_map(move |query| {
+            let output_alias = output_alias.clone() + &query.table.as_sql_name();
+            FromClause::Query {
+                query: Box::new(query),
+                output_alias,
+            }
+        })
+    })
 }
 
 #[derive(Debug, PartialEq, Hash, Clone)]
@@ -319,17 +384,29 @@ fn my_literal_expression_model_strategy() -> impl Strategy<Value = ExpressionMod
 }
 
 fn my_table_projection_expression_model_strategy(
-    table: TableModel,
-) -> impl Strategy<Value = ExpressionModel> {
-    prop_oneof![my_literal_expression_model_strategy(), {
-        let column_strategy = proptest::sample::select(table.columns.clone());
-        column_strategy.prop_map(move |column: ColumnModel| {
-            ExpressionModel::ColumnProjection(ColumnProjection {
-                source_alias: table.as_sql_name(),
-                column,
-            })
-        })
-    }]
+    from_clause: &FromClause,
+) -> Option<impl Strategy<Value = ExpressionModel>> {
+    let column_models: Vec<ColumnModel> = from_clause
+        .output_column_info()
+        .iter()
+        .filter_map(|c| c.try_into().ok())
+        .collect();
+
+    if column_models.is_empty() {
+        None
+    } else {
+        let column_strategy = proptest::sample::select(column_models);
+        let source_alias = from_clause.as_sql_name();
+        let result = (Just(source_alias), column_strategy).prop_map(
+            move |(source_alias, column): (String, ColumnModel)| {
+                ExpressionModel::ColumnProjection(ColumnProjection {
+                    source_alias,
+                    column,
+                })
+            },
+        );
+        Some(result)
+    }
 }
 
 fn my_expression_tree_strategy<E: 'static + Strategy<Value = ExpressionModel>>(
@@ -461,100 +538,80 @@ fn my_orderby_strategy<E: 'static + Strategy<Value = ExpressionModel>>(
     expression_strategy: E,
 ) -> impl Strategy<Value = OrderByModel> {
     let orderby_expression_model_strategy = my_orderby_expression_strategy(expression_strategy);
-    let all_expressions_strategy = prop::collection::vec(orderby_expression_model_strategy, 0..10);
+    let all_expressions_strategy = prop::collection::vec(orderby_expression_model_strategy, 0..3);
     all_expressions_strategy.prop_map(|expressions| OrderByModel { expressions })
 }
 
 #[derive(Debug, PartialEq, Hash, Clone)]
 struct QueryModel {
     pub projections: Vec<ExpressionModel>,
-    pub table: Option<TableModel>,
+    pub table: FromClause,
     pub orderby: OrderByModel,
 }
 
 impl QueryModel {
     pub fn as_sql_code(&self) -> String {
-        if let Some(table) = &self.table {
-            format!(
-                "SELECT {} FROM {} {}",
-                self.projections
-                    .iter()
-                    .map(|c| c.as_sql_code())
-                    .collect::<Vec<_>>()
-                    .join(","),
-                &table.as_sql_code(),
-                self.orderby.as_sql_code()
-            )
-        } else {
-            format!(
-                "SELECT {} {}",
-                self.projections
-                    .iter()
-                    .map(|c| c.as_sql_code())
-                    .collect::<Vec<_>>()
-                    .join(","),
-                &self.orderby.as_sql_code()
-            )
-        }
+        format!(
+            "SELECT {} {} {}",
+            self.projections
+                .iter()
+                .map(|c| c.as_sql_code())
+                .collect::<Vec<_>>()
+                .join(","),
+            self.table.as_sql_code(),
+            self.orderby.as_sql_code()
+        )
     }
 
     pub fn as_sql_code_distinct_types(&self) -> String {
-        if let Some(table) = &self.table {
-            format!(
-                "SELECT DISTINCT {} FROM {} {}",
-                self.projections
-                    .iter()
-                    .map(|c| c.as_sql_code())
-                    .collect::<Vec<_>>()
-                    .join(","),
-                &table.as_sql_code(),
-                self.orderby.as_sql_code()
-            )
-        } else {
-            format!(
-                "SELECT {}",
-                self.projections
-                    .iter()
-                    .map(|c| c.as_sql_code())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            )
-        }
+        format!("SELECT DISTINCT * FROM ({}) LIMIT 100", self.as_sql_code())
+    }
+
+    fn output_column_info(&self) -> Vec<ColumnInfo> {
+        self.projections
+            .iter()
+            .map(|c| c.output_column_info())
+            .collect()
     }
 }
 
-fn my_query_strategy_args<T: 'static + Strategy<Value = Option<TableModel>>>(
+fn my_query_strategy_args<T: 'static + Strategy<Value = FromClause>>(
     table_strategy: T,
 ) -> impl Strategy<Value = QueryModel> {
     table_strategy.prop_flat_map(move |table| {
-        let leaf_strategy: BoxedStrategy<ExpressionModel> = if let Some(table) = table.clone() {
-            my_table_projection_expression_model_strategy(table.clone()).boxed()
+        let maybe_table_col_strategy = my_table_projection_expression_model_strategy(&table);
+        let leaf_strategy = if let Some(table_column_strategy) = maybe_table_col_strategy {
+            prop_oneof![
+                my_literal_expression_model_strategy(),
+                table_column_strategy
+            ]
+            .boxed()
         } else {
             my_literal_expression_model_strategy().boxed()
         };
 
         let expression_model_strategy = my_expression_tree_strategy(leaf_strategy);
         let select_columns_strategy =
-            prop::collection::vec(expression_model_strategy.clone(), 1..10);
+            prop::collection::vec(expression_model_strategy.clone(), 1..3);
         let orderby_strategy = my_orderby_strategy(expression_model_strategy);
 
-        (select_columns_strategy, orderby_strategy).prop_map(move |(projections, orderby)| {
-            QueryModel {
+        (select_columns_strategy, Just(table), orderby_strategy).prop_map(
+            move |(projections, table, orderby)| QueryModel {
                 projections,
-                table: table.clone(),
+                table,
                 orderby,
-            }
-        })
+            },
+        )
     })
 }
 
-fn my_query_strategy() -> impl Strategy<Value = QueryModel> {
-    my_query_strategy_args(proptest::option::of(my_table_strategy()))
+fn my_query_strategy(alias: String) -> impl Strategy<Value = QueryModel> {
+    my_query_strategy_args(my_from_clause_strategy(alias.clone()))
 }
 
 proptest! {
     #[test]
-    fn describe_query_prop_test(query_model in my_query_strategy()) {
+    fn describe_query_prop_test(query_model in my_query_strategy("a".to_string())) {
         eprintln!("{:?}",query_model);
         let res = ::sqlx_rt::async_std::task::block_on(async{
             let mut conn = new::<Sqlite>().await.unwrap();
@@ -564,10 +621,8 @@ proptest! {
 
                 let columns = info.columns();
 
-                for (i,expr_model) in query_model.projections.iter().enumerate()
+                for (i,expected_column) in query_model.output_column_info().iter().enumerate()
                 {
-                    let expected_column = expr_model.output_column_info();
-
                     if let Some(expected_column_name) = expected_column.name
                     {
                         prop_assert_eq!(&columns[i].name(), &expected_column_name);
@@ -582,11 +637,8 @@ proptest! {
 
             for row in rows
             {
-                let columns = row.columns();
-
-                for (i,expr_model) in query_model.projections.iter().enumerate()
+                for (i,expected_column) in query_model.output_column_info().iter().enumerate()
                 {
-                   let expected_column = expr_model.output_column_info();
                    let actual_value = row.try_get_raw(i)?;
                    let actual_type_info = actual_value.type_info();
 
