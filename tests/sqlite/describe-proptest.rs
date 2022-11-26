@@ -716,17 +716,43 @@ fn my_orderby_strategy<E: 'static + Strategy<Value = ExpressionModel>>(
     all_expressions_strategy.prop_map(|expressions| OrderByModel { expressions })
 }
 
+#[derive(Debug, Clone, Copy)]
+struct LimitOffsetModel {
+    pub limit: isize,
+    pub offset: Option<isize>,
+}
+
+impl LimitOffsetModel {
+    pub fn as_sql_code(&self) -> String {
+        if let Some(offset) = self.offset {
+            format!("LIMIT {} OFFSET {}", self.limit, offset)
+        } else {
+            format!("LIMIT {}", self.limit)
+        }
+    }
+}
+
+fn my_limit_offset_strategy() -> impl Strategy<Value = LimitOffsetModel> {
+    //avoiding limit 0, because if we return 0 results then any typing is 'safe'
+    let limit_strategy = proptest::sample::select(vec![-1, 1, 1000000]);
+    let offset_strategy =
+        proptest::sample::select(vec![None, Some(-1), Some(0), Some(1), Some(1000000)]);
+
+    (limit_strategy, offset_strategy).prop_map(|(limit, offset)| LimitOffsetModel { limit, offset })
+}
+
 #[derive(Debug, Clone)]
 struct QueryModel {
     pub projections: Vec<ExpressionModel>,
     pub from: Option<Rc<FromJoinClauseModel>>,
     pub orderby: OrderByModel,
+    pub limit_offset: Option<LimitOffsetModel>,
 }
 
 impl QueryModel {
     pub fn as_sql_code(&self) -> String {
         format!(
-            "SELECT {} {} {}",
+            "SELECT {} {} {} {}",
             self.projections
                 .iter()
                 .map(|c| c.as_sql_code())
@@ -736,7 +762,11 @@ impl QueryModel {
                 Some(table) => table.as_sql_code(),
                 None => String::new(),
             },
-            self.orderby.as_sql_code()
+            self.orderby.as_sql_code(),
+            match &self.limit_offset {
+                Some(limit_offset) => limit_offset.as_sql_code(),
+                None => String::new(),
+            }
         )
     }
 
@@ -779,14 +809,22 @@ fn my_query_strategy(
         let select_columns_strategy =
             prop::collection::vec(expression_model_strategy.clone(), 1..3);
         let orderby_strategy = my_orderby_strategy(expression_model_strategy);
+        let limit_offset_strategy = proptest::option::of(my_limit_offset_strategy());
 
-        (select_columns_strategy, Just(from_clause), orderby_strategy).prop_map(
-            move |(projections, from, orderby)| QueryModel {
-                projections,
-                from,
-                orderby,
-            },
+        (
+            select_columns_strategy,
+            Just(from_clause),
+            orderby_strategy,
+            limit_offset_strategy,
         )
+            .prop_map(
+                move |(projections, from, orderby, limit_offset)| QueryModel {
+                    projections,
+                    from,
+                    orderby,
+                    limit_offset,
+                },
+            )
     })
 }
 
