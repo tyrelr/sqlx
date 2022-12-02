@@ -593,7 +593,7 @@ fn my_table_projection_expression_model_strategy(
 fn my_expression_tree_strategy<E: 'static + Strategy<Value = ExpressionModel>>(
     leaf_strategy: E,
 ) -> impl Strategy<Value = ExpressionModel> + Clone {
-    leaf_strategy.prop_recursive(5, 15, 2, move |leaf| {
+    leaf_strategy.prop_recursive(1, 15, 2, move |leaf| {
         let operation_strategy = std::sync::Arc::new(prop_oneof![
             Just(InfixNumericOperationType::Add),
             Just(InfixNumericOperationType::Sub),
@@ -805,7 +805,7 @@ fn my_query_strategy(
             my_literal_expression_model_strategy().boxed()
         };
 
-        let expression_model_strategy = my_expression_tree_strategy(expression_leaf_strategy);
+        let expression_model_strategy = expression_leaf_strategy; //my_expression_tree_strategy(expression_leaf_strategy);
         let select_columns_strategy =
             prop::collection::vec(expression_model_strategy.clone(), 1..3);
         let orderby_strategy = my_orderby_strategy(expression_model_strategy);
