@@ -566,11 +566,17 @@ fn my_literal_expression_model_strategy() -> impl Strategy<Value = ExpressionMod
 }
 
 fn my_option_table_projection_expression_model_strategy(
-    from_clause: &Option<Rc<FromJoinClauseModel>>,
+    group_by_clause: Option<&GroupByModel>,
+    from_clause: Option<&Rc<FromJoinClauseModel>>,
 ) -> Option<impl Strategy<Value = ExpressionModel>> {
-    match from_clause {
-        Some(from_clause) => my_table_projection_expression_model_strategy(from_clause),
-        None => None,
+    match (group_by_clause, from_clause) {
+        (Some(groupby_clause), _) => {
+            my_groupby_projection_expression_model_strategy(&groupby_clause).map(Strategy::boxed)
+        }
+        (None, Some(from_clause)) => {
+            my_table_projection_expression_model_strategy(&from_clause).map(Strategy::boxed)
+        }
+        (None, None) => None,
     }
 }
 
@@ -587,6 +593,18 @@ fn my_table_projection_expression_model_strategy(
         None
     } else {
         Some(proptest::sample::select(column_models).prop_map(ExpressionModel::ColumnProjection))
+    }
+}
+
+fn my_groupby_projection_expression_model_strategy(
+    groupby_clause: &GroupByModel,
+) -> Option<impl Strategy<Value = ExpressionModel>> {
+    if groupby_clause.key_expressions.is_empty() {
+        None
+    } else {
+        Some(proptest::sample::select(
+            groupby_clause.key_expressions.clone(),
+        ))
     }
 }
 
@@ -607,6 +625,38 @@ fn my_expression_tree_strategy<E: 'static + Strategy<Value = ExpressionModel>>(
                 right,
             }))
         })
+    })
+}
+
+#[derive(Debug, Clone)]
+struct GroupByModel {
+    pub key_expressions: Vec<ExpressionModel>,
+    //pub value_expressions: Vec<Rc<ExpressionModel>>,
+}
+
+impl GroupByModel {
+    pub fn as_sql_code(&self) -> String {
+        if !self.key_expressions.is_empty() {
+            format!(
+                "GROUP BY {}",
+                self.key_expressions
+                    .iter()
+                    .map(|c| c.as_sql_code())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        } else {
+            "".to_string()
+        }
+    }
+}
+
+fn my_groupby_model_strategy<E: 'static + Strategy<Value = ExpressionModel>>(
+    expression_strategy: E,
+) -> impl Strategy<Value = GroupByModel> {
+    let all_expressions_strategy = prop::collection::vec(expression_strategy, 0..3);
+    all_expressions_strategy.prop_map(|expressions| GroupByModel {
+        key_expressions: expressions,
     })
 }
 
@@ -745,6 +795,7 @@ fn my_limit_offset_strategy() -> impl Strategy<Value = LimitOffsetModel> {
 struct QueryModel {
     pub projections: Vec<ExpressionModel>,
     pub from: Option<Rc<FromJoinClauseModel>>,
+    pub groupby: Option<GroupByModel>,
     pub orderby: OrderByModel,
     pub limit_offset: Option<LimitOffsetModel>,
 }
@@ -752,7 +803,7 @@ struct QueryModel {
 impl QueryModel {
     pub fn as_sql_code(&self) -> String {
         format!(
-            "SELECT {} {} {} {}",
+            "SELECT {} {} {} {} {}",
             self.projections
                 .iter()
                 .map(|c| c.as_sql_code())
@@ -762,11 +813,15 @@ impl QueryModel {
                 Some(table) => table.as_sql_code(),
                 None => String::new(),
             },
+            match &self.groupby {
+                Some(groupby) => groupby.as_sql_code(),
+                None => String::new(),
+            },
             self.orderby.as_sql_code(),
             match &self.limit_offset {
                 Some(limit_offset) => limit_offset.as_sql_code(),
                 None => String::new(),
-            }
+            },
         )
     }
 
@@ -792,46 +847,73 @@ fn my_query_strategy(
     ));
 
     from_clause_strategy.prop_flat_map(move |from_clause| {
-        let table_column_strategy =
-            my_option_table_projection_expression_model_strategy(&from_clause);
+        let table_column_projection_strategy =
+            my_option_table_projection_expression_model_strategy(None, from_clause.as_ref());
 
-        let expression_leaf_strategy = if let Some(table_column_strategy) = table_column_strategy {
-            prop_oneof![
-                my_literal_expression_model_strategy(),
-                table_column_strategy
-            ]
-            .boxed()
-        } else {
-            my_literal_expression_model_strategy().boxed()
-        };
+        let expression_leaf_strategy =
+            if let Some(table_column_projection_strategy) = table_column_projection_strategy {
+                prop_oneof![
+                    my_literal_expression_model_strategy(),
+                    table_column_projection_strategy
+                ]
+                .boxed()
+            } else {
+                my_literal_expression_model_strategy().boxed()
+            };
 
         let expression_model_strategy = expression_leaf_strategy; //my_expression_tree_strategy(expression_leaf_strategy);
-        let select_columns_strategy =
-            prop::collection::vec(expression_model_strategy.clone(), 1..3);
-        let orderby_strategy = my_orderby_strategy(expression_model_strategy);
-        let limit_offset_strategy = proptest::option::of(my_limit_offset_strategy());
 
-        (
-            select_columns_strategy,
-            Just(from_clause),
-            orderby_strategy,
-            limit_offset_strategy,
-        )
-            .prop_map(
-                move |(projections, from, orderby, limit_offset)| QueryModel {
-                    projections,
-                    from,
-                    orderby,
-                    limit_offset,
-                },
+        let groupby_strategy =
+            proptest::option::of(my_groupby_model_strategy(expression_model_strategy));
+
+        (Just(from_clause), groupby_strategy).prop_flat_map(move |(from_clause, groupby_clause)| {
+            let column_projection_strategy = my_option_table_projection_expression_model_strategy(
+                groupby_clause.as_ref(),
+                from_clause.as_ref(),
+            );
+
+            let expression_leaf_strategy =
+                if let Some(column_projection_strategy) = column_projection_strategy {
+                    prop_oneof![
+                        my_literal_expression_model_strategy(),
+                        column_projection_strategy
+                    ]
+                    .boxed()
+                } else {
+                    my_literal_expression_model_strategy().boxed()
+                };
+
+            let expression_model_strategy = expression_leaf_strategy; //my_expression_tree_strategy(expression_leaf_strategy);
+
+            let select_columns_strategy =
+                prop::collection::vec(expression_model_strategy.clone(), 1..3);
+            let orderby_strategy = my_orderby_strategy(expression_model_strategy);
+            let limit_offset_strategy = proptest::option::of(my_limit_offset_strategy());
+
+            (
+                select_columns_strategy, //todo: use group by outputs instead of table outputs
+                Just(from_clause),
+                Just(groupby_clause),
+                orderby_strategy,
+                limit_offset_strategy,
             )
+                .prop_map(
+                    move |(projections, from, groupby, orderby, limit_offset)| QueryModel {
+                        projections,
+                        from,
+                        groupby,
+                        orderby,
+                        limit_offset,
+                    },
+                )
+        })
     })
 }
 
 proptest! {
     #[test]
     fn describe_query_prop_test(query_model in my_query_strategy(Rc::new(()),3)) {
-        eprintln!("QUERY MODEL:{:?}\nQUERY:{}",query_model, query_model.as_sql_code());
+        eprintln!("QUERY MODEL:{:?}\nQUERY:{}\nEXPECTED:{:?}",query_model, query_model.as_sql_code(),query_model.output_column_info());
         let res = ::sqlx_rt::async_std::task::block_on(async{
             let mut conn = new::<Sqlite>().await.unwrap();
             {
@@ -845,8 +927,8 @@ proptest! {
                     {
                         prop_assert_eq!(&columns[i].name(), &expected_column_name);
                     }
-                    prop_assert_eq!(info.nullable(i), Some(expected_column.nullable));
-                    prop_assert_eq!(columns[i].type_info().name(), expected_column.col_type.name());
+                    prop_assert_eq!(info.nullable(i), Some(expected_column.nullable), "column {}", i);
+                    prop_assert_eq!(columns[i].type_info().name(), expected_column.col_type.name(), "column {}", i);
                 }
             }
 
