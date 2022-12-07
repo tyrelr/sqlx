@@ -230,6 +230,12 @@ impl FromClauseLeafModel {
                 .collect(),
         }
     }
+    fn max_possible_rows(&self) -> usize {
+        match self {
+            Self::Table { table, .. } => 10, //all the built in tables have roughly 10 rows
+            Self::Query { query, .. } => query.max_possible_rows(),
+        }
+    }
 }
 
 impl TableContext for FromClauseLeafModel {
@@ -335,6 +341,14 @@ impl FromJoinClauseModel {
                 let mut columns = first.output_column_info();
                 columns.extend(second.output_column_info());
                 columns
+            }
+        }
+    }
+    fn max_possible_rows(&self) -> usize {
+        match self {
+            Self::FromClause { from, .. } => from.max_possible_rows(),
+            Self::JoinClause { first, second, .. } => {
+                first.max_possible_rows() * second.max_possible_rows()
             }
         }
     }
@@ -780,6 +794,20 @@ impl LimitOffsetModel {
             format!("LIMIT {}", self.limit)
         }
     }
+    fn max_possible_rows(&self, table_rows: usize) -> usize {
+        let rows_after_offset: usize = match self.offset {
+            Some(offset) if offset < 1 => table_rows,
+            Some(offset) if table_rows < (offset as usize) => 0,
+            Some(offset) => table_rows - (offset as usize),
+            None => table_rows,
+        };
+
+        if self.limit < 0 {
+            rows_after_offset
+        } else {
+            std::cmp::min(rows_after_offset, self.limit as usize)
+        }
+    }
 }
 
 fn my_limit_offset_strategy() -> impl Strategy<Value = LimitOffsetModel> {
@@ -827,6 +855,18 @@ impl QueryModel {
 
     pub fn as_sql_code_distinct_types(&self) -> String {
         format!("SELECT DISTINCT * FROM ({}) LIMIT 100", self.as_sql_code())
+    }
+
+    pub fn max_possible_rows(&self) -> usize {
+        let possible_rows = match &self.from {
+            Some(table) => table.max_possible_rows(),
+            None => 1,
+        };
+
+        match &self.limit_offset {
+            Some(limit_offset) => limit_offset.max_possible_rows(possible_rows),
+            None => possible_rows,
+        }
     }
 
     fn output_column_info(&self) -> Vec<ColumnInfo> {
@@ -910,9 +950,14 @@ fn my_query_strategy(
     })
 }
 
+fn my_root_query_strategy() -> impl Strategy<Value = QueryModel> {
+    my_query_strategy(Rc::new(()), 3)
+        .prop_filter("query results in no rows", |q| q.max_possible_rows() > 0)
+}
+
 proptest! {
     #[test]
-    fn describe_query_prop_test(query_model in my_query_strategy(Rc::new(()),3)) {
+    fn describe_query_prop_test(query_model in my_root_query_strategy()) {
         eprintln!("QUERY MODEL:{:?}\nQUERY:{}\nEXPECTED:{:?}",query_model, query_model.as_sql_code(),query_model.output_column_info());
         let res = ::sqlx_rt::async_std::task::block_on(async{
             let mut conn = new::<Sqlite>().await.unwrap();
