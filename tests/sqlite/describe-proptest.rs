@@ -450,8 +450,13 @@ impl ColumnProjectionModel {
         format!("\"{}\".{}", self.source_alias, self.column.as_sql_code())
     }
 
-    fn output_column_info(&self) -> ColumnInfo {
-        self.column.to_column_info()
+    fn output_column_info(&self, forced_single_group: bool) -> ColumnInfo {
+        let inner_info = self.column.to_column_info();
+        ColumnInfo {
+            name: None,
+            col_type: inner_info.col_type,
+            nullable: inner_info.nullable || forced_single_group,
+        }
     }
 }
 
@@ -529,19 +534,80 @@ impl InfixNumericOperationModel {
             self.right.as_sql_code()
         )
     }
-    fn output_column_info(&self) -> ColumnInfo {
+    fn output_column_info(&self, forced_single_group: bool) -> ColumnInfo {
         ColumnInfo {
             name: None,
             col_type: self.operation.output_column_type(
-                &self.left.output_column_info(),
-                &self.right.output_column_info(),
+                &self.left.output_column_info(forced_single_group),
+                &self.right.output_column_info(forced_single_group),
             ),
             nullable: self.operation.output_nullable(
-                &self.left.output_column_info(),
-                &self.right.output_column_info(),
+                &self.left.output_column_info(forced_single_group),
+                &self.right.output_column_info(forced_single_group),
             ),
         }
     }
+    fn is_aggregate(&self) -> bool {
+        self.left.is_aggregate() || self.right.is_aggregate()
+    }
+}
+
+#[derive(Debug, Clone)]
+enum UnaryAggregateFunction {
+    Sum,
+    Count,
+}
+
+#[derive(Debug, Clone)]
+struct AggregateFunctionModel {
+    func: UnaryAggregateFunction,
+    expr: ExpressionModel,
+}
+
+impl AggregateFunctionModel {
+    fn as_sql_code(&self) -> String {
+        let fname = match self.func {
+            UnaryAggregateFunction::Sum => "SUM",
+            UnaryAggregateFunction::Count => "COUNT",
+        };
+        format!("{}({})", fname, self.expr.as_sql_code())
+    }
+    fn output_column_info(&self, forced_single_group: bool) -> ColumnInfo {
+        match self.func {
+            UnaryAggregateFunction::Sum => {
+                let inner_info = self.expr.output_column_info(false);
+                ColumnInfo {
+                    name: None,
+                    col_type: match inner_info.col_type {
+                        ColType::Boolean => ColType::Integer,
+                        ColType::Integer => ColType::Integer,
+                        ColType::Real => ColType::Real,
+                        ColType::Text => ColType::Real,
+                        ColType::Blob => ColType::Real,
+                    },
+                    nullable: inner_info.nullable || forced_single_group,
+                }
+            }
+            UnaryAggregateFunction::Count => ColumnInfo {
+                name: None,
+                col_type: ColType::Integer,
+                nullable: false,
+            },
+        }
+    }
+}
+
+fn my_aggregate_expression_strategy<E: 'static + Strategy<Value = ExpressionModel> + Clone>(
+    leaf_strategy: E,
+) -> impl Strategy<Value = ExpressionModel> + Clone {
+    let func_strategy = std::sync::Arc::new(prop_oneof![
+        Just(UnaryAggregateFunction::Sum),
+        Just(UnaryAggregateFunction::Count),
+    ]);
+
+    (func_strategy, leaf_strategy).prop_map(|(func, expr)| {
+        ExpressionModel::AggregateFunction(Box::new(AggregateFunctionModel { func, expr }))
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -549,6 +615,7 @@ enum ExpressionModel {
     LiteralValue(LiteralValueModel),
     ColumnProjection(ColumnProjectionModel),
     InfixNumericOperation(Box<InfixNumericOperationModel>),
+    AggregateFunction(Box<AggregateFunctionModel>),
 }
 
 impl ExpressionModel {
@@ -557,14 +624,25 @@ impl ExpressionModel {
             Self::LiteralValue(lit) => lit.as_sql_code(),
             Self::ColumnProjection(col) => col.as_sql_code(),
             Self::InfixNumericOperation(op) => op.as_sql_code(),
+            Self::AggregateFunction(f) => f.as_sql_code(),
         }
     }
 
-    fn output_column_info(&self) -> ColumnInfo {
+    fn output_column_info(&self, forced_single_group: bool) -> ColumnInfo {
         match self {
             Self::LiteralValue(lit) => lit.output_column_info(),
-            Self::ColumnProjection(col) => col.output_column_info(),
-            Self::InfixNumericOperation(op) => op.output_column_info(),
+            Self::ColumnProjection(col) => col.output_column_info(forced_single_group),
+            Self::InfixNumericOperation(op) => op.output_column_info(forced_single_group),
+            Self::AggregateFunction(f) => f.output_column_info(forced_single_group),
+        }
+    }
+
+    fn is_aggregate(&self) -> bool {
+        match self {
+            Self::LiteralValue(lit) => false,
+            Self::ColumnProjection(col) => false,
+            Self::InfixNumericOperation(op) => op.is_aggregate(),
+            Self::AggregateFunction(f) => true,
         }
     }
 }
@@ -582,7 +660,7 @@ fn my_literal_expression_model_strategy() -> impl Strategy<Value = ExpressionMod
 fn my_option_table_projection_expression_model_strategy(
     group_by_clause: Option<&GroupByModel>,
     from_clause: Option<&Rc<FromJoinClauseModel>>,
-) -> Option<impl Strategy<Value = ExpressionModel>> {
+) -> Option<impl Strategy<Value = ExpressionModel> + Clone> {
     match (group_by_clause, from_clause) {
         (Some(groupby_clause), _) => {
             my_groupby_projection_expression_model_strategy(&groupby_clause).map(Strategy::boxed)
@@ -645,7 +723,6 @@ fn my_expression_tree_strategy<E: 'static + Strategy<Value = ExpressionModel>>(
 #[derive(Debug, Clone)]
 struct GroupByModel {
     pub key_expressions: Vec<ExpressionModel>,
-    //pub value_expressions: Vec<Rc<ExpressionModel>>,
 }
 
 impl GroupByModel {
@@ -668,7 +745,7 @@ impl GroupByModel {
 fn my_groupby_model_strategy<E: 'static + Strategy<Value = ExpressionModel>>(
     expression_strategy: E,
 ) -> impl Strategy<Value = GroupByModel> {
-    let all_expressions_strategy = prop::collection::vec(expression_strategy, 0..3);
+    let all_expressions_strategy = prop::collection::vec(expression_strategy, 1..3);
     all_expressions_strategy.prop_map(|expressions| GroupByModel {
         key_expressions: expressions,
     })
@@ -741,6 +818,9 @@ fn my_orderby_expression_strategy<E: 'static + Strategy<Value = ExpressionModel>
         Just(NullOrderModel::First),
         Just(NullOrderModel::Last)
     ];
+    let expression_strategy = expression_strategy.prop_filter("literalIntInOrderBy", |e| {
+        !matches!(e, ExpressionModel::LiteralValue(LiteralValueModel::Integer))
+    });
     (expression_strategy, order_strategy, null_order_strategy).prop_map(
         |(expression, order, null_order)| OrderByExpressionModel {
             expression,
@@ -870,10 +950,38 @@ impl QueryModel {
     }
 
     fn output_column_info(&self) -> Vec<ColumnInfo> {
+        let is_forced_single_row =
+            (!self.groupby.is_some()) && self.projections.iter().any(|c| c.is_aggregate());
         self.projections
             .iter()
-            .map(|c| c.output_column_info())
+            .map(|c| c.output_column_info(is_forced_single_row))
             .collect()
+    }
+}
+
+fn my_expression_strategy(
+    from_clause: Option<&Rc<FromJoinClauseModel>>,
+    groupby_clause: Option<&GroupByModel>,
+    use_aggregates: bool,
+) -> impl Strategy<Value = ExpressionModel> + Clone + 'static {
+    let literal_strategy = my_literal_expression_model_strategy();
+
+    let column_projection_strategy =
+        my_option_table_projection_expression_model_strategy(groupby_clause, from_clause);
+
+    let aggregated_expression_strategy = if use_aggregates {
+        let ungrouped_projection =
+            my_option_table_projection_expression_model_strategy(None, from_clause);
+        ungrouped_projection.map(my_aggregate_expression_strategy)
+    } else {
+        None
+    };
+
+    match (column_projection_strategy, aggregated_expression_strategy) {
+        (Some(s1), Some(s2)) => prop_oneof![literal_strategy, s1, s2].boxed(),
+        (Some(s1), None) => prop_oneof![literal_strategy, s1].boxed(),
+        (None, Some(s2)) => prop_oneof![literal_strategy, s2].boxed(),
+        (None, None) => literal_strategy.boxed(),
     }
 }
 
@@ -887,65 +995,54 @@ fn my_query_strategy(
     ));
 
     from_clause_strategy.prop_flat_map(move |from_clause| {
-        let table_column_projection_strategy =
-            my_option_table_projection_expression_model_strategy(None, from_clause.as_ref());
-
-        let expression_leaf_strategy =
-            if let Some(table_column_projection_strategy) = table_column_projection_strategy {
-                prop_oneof![
-                    my_literal_expression_model_strategy(),
-                    table_column_projection_strategy
-                ]
-                .boxed()
-            } else {
-                my_literal_expression_model_strategy().boxed()
-            };
-
-        let expression_model_strategy = expression_leaf_strategy; //my_expression_tree_strategy(expression_leaf_strategy);
+        let groupby_expression_strategy = my_expression_strategy(from_clause.as_ref(), None, false)
+            .prop_filter("literalIntInOrderBy", |e| {
+                !matches!(e, ExpressionModel::LiteralValue(LiteralValueModel::Integer))
+            });
 
         let groupby_strategy =
-            proptest::option::of(my_groupby_model_strategy(expression_model_strategy));
+            proptest::option::of(my_groupby_model_strategy(groupby_expression_strategy));
 
         (Just(from_clause), groupby_strategy).prop_flat_map(move |(from_clause, groupby_clause)| {
-            let column_projection_strategy = my_option_table_projection_expression_model_strategy(
-                groupby_clause.as_ref(),
-                from_clause.as_ref(),
-            );
-
-            let expression_leaf_strategy =
-                if let Some(column_projection_strategy) = column_projection_strategy {
-                    prop_oneof![
-                        my_literal_expression_model_strategy(),
-                        column_projection_strategy
-                    ]
-                    .boxed()
-                } else {
-                    my_literal_expression_model_strategy().boxed()
-                };
-
-            let expression_model_strategy = expression_leaf_strategy; //my_expression_tree_strategy(expression_leaf_strategy);
-
+            let select_expression_strategy =
+                my_expression_strategy(from_clause.as_ref(), groupby_clause.as_ref(), true);
             let select_columns_strategy =
-                prop::collection::vec(expression_model_strategy.clone(), 1..3);
-            let orderby_strategy = my_orderby_strategy(expression_model_strategy);
-            let limit_offset_strategy = proptest::option::of(my_limit_offset_strategy());
+                prop::collection::vec(select_expression_strategy.clone(), 1..3);
 
             (
-                select_columns_strategy, //todo: use group by outputs instead of table outputs
+                select_columns_strategy,
                 Just(from_clause),
                 Just(groupby_clause),
-                orderby_strategy,
-                limit_offset_strategy,
             )
-                .prop_map(
-                    move |(projections, from, groupby, orderby, limit_offset)| QueryModel {
-                        projections,
-                        from,
-                        groupby,
-                        orderby,
-                        limit_offset,
-                    },
-                )
+                .prop_flat_map(move |(projections, from_clause, groupby_clause)| {
+                    let is_aggregate = projections.iter().any(|expr| expr.is_aggregate())
+                        || groupby_clause.is_some();
+                    let orderby_expression_strategy = my_expression_strategy(
+                        from_clause.as_ref(),
+                        groupby_clause.as_ref(),
+                        is_aggregate,
+                    );
+                    let orderby_clause_strategy = my_orderby_strategy(orderby_expression_strategy);
+
+                    let limit_offset_strategy = proptest::option::of(my_limit_offset_strategy());
+
+                    (
+                        Just(projections),
+                        Just(from_clause),
+                        Just(groupby_clause),
+                        orderby_clause_strategy,
+                        limit_offset_strategy,
+                    )
+                        .prop_map(
+                            move |(projections, from, groupby, orderby, limit_offset)| QueryModel {
+                                projections,
+                                from,
+                                groupby,
+                                orderby,
+                                limit_offset,
+                            },
+                        )
+                })
         })
     })
 }
