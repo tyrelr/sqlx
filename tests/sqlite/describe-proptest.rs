@@ -599,15 +599,32 @@ impl AggregateFunctionModel {
 
 fn my_aggregate_expression_strategy<E: 'static + Strategy<Value = ExpressionModel> + Clone>(
     leaf_strategy: E,
+    max_possible_rows: usize,
 ) -> impl Strategy<Value = ExpressionModel> + Clone {
-    let func_strategy = std::sync::Arc::new(prop_oneof![
-        Just(UnaryAggregateFunction::Sum),
-        Just(UnaryAggregateFunction::Count),
-    ]);
-
-    (func_strategy, leaf_strategy).prop_map(|(func, expr)| {
-        ExpressionModel::AggregateFunction(Box::new(AggregateFunctionModel { func, expr }))
-    })
+    if max_possible_rows > 0 {
+        prop_oneof![
+            leaf_strategy
+                .clone()
+                .prop_map(|expr| AggregateFunctionModel {
+                    func: UnaryAggregateFunction::Count,
+                    expr
+                }),
+            leaf_strategy.prop_map(|expr| AggregateFunctionModel {
+                func: UnaryAggregateFunction::Sum,
+                expr
+            }),
+        ]
+        .boxed()
+    } else {
+        //the output types don't depend on input types, so it doesn't matter if any rows are selected
+        leaf_strategy
+            .prop_map(|expr| AggregateFunctionModel {
+                func: UnaryAggregateFunction::Count,
+                expr,
+            })
+            .boxed()
+    }
+    .prop_map(|agg| ExpressionModel::AggregateFunction(Box::new(agg)))
 }
 
 #[derive(Debug, Clone)]
@@ -938,9 +955,13 @@ impl QueryModel {
     }
 
     pub fn max_possible_rows(&self) -> usize {
-        let possible_rows = match &self.from {
-            Some(table) => table.max_possible_rows(),
-            None => 1,
+        let possible_rows = if self.is_forced_single_row() {
+            1
+        } else {
+            match &self.from {
+                Some(table) => table.max_possible_rows(),
+                None => 1,
+            }
         };
 
         match &self.limit_offset {
@@ -950,12 +971,15 @@ impl QueryModel {
     }
 
     fn output_column_info(&self) -> Vec<ColumnInfo> {
-        let is_forced_single_row =
-            (!self.groupby.is_some()) && self.projections.iter().any(|c| c.is_aggregate());
+        let is_forced_single_row = self.is_forced_single_row();
         self.projections
             .iter()
             .map(|c| c.output_column_info(is_forced_single_row))
             .collect()
+    }
+
+    fn is_forced_single_row(&self) -> bool {
+        (self.groupby.is_none()) && self.projections.iter().any(|c| c.is_aggregate())
     }
 }
 
@@ -972,7 +996,12 @@ fn my_expression_strategy(
     let aggregated_expression_strategy = if use_aggregates {
         let ungrouped_projection =
             my_option_table_projection_expression_model_strategy(None, from_clause);
-        ungrouped_projection.map(my_aggregate_expression_strategy)
+        ungrouped_projection.map(|expr_strategy| {
+            my_aggregate_expression_strategy(
+                expr_strategy,
+                from_clause.map(|j| j.max_possible_rows()).unwrap_or(1),
+            )
+        })
     } else {
         None
     };
@@ -1070,7 +1099,16 @@ proptest! {
                         prop_assert_eq!(&columns[i].name(), &expected_column_name);
                     }
                     prop_assert_eq!(info.nullable(i), Some(expected_column.nullable), "column {}", i);
-                    prop_assert_eq!(columns[i].type_info().name(), expected_column.col_type.name(), "column {}", i);
+
+                    if (columns[i].type_info().name() == "BOOLEAN" && expected_column.col_type.name() == "INTEGER")
+                    || (columns[i].type_info().name() == "INTEGER" && expected_column.col_type.name() == "BOOLEAN")
+                    {
+                        //boolean is just a subtype of integer, so this is fine
+                    }
+                    else
+                    {
+                        prop_assert_eq!(columns[i].type_info().name(), expected_column.col_type.name(), "column {}", i);
+                    }
                 }
             }
 
